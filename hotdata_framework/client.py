@@ -9,7 +9,9 @@ from typing import Any, Literal
 from hotdata import ApiClient, Configuration
 from hotdata.api.connections_api import ConnectionsApi
 from hotdata.api.databases_api import DatabasesApi
+from hotdata.api.indexes_api import IndexesApi
 from hotdata.api.information_schema_api import InformationSchemaApi
+from hotdata.api.jobs_api import JobsApi
 from hotdata.api.query_api import QueryApi
 from hotdata.api.query_runs_api import QueryRunsApi
 from hotdata.api.results_api import ResultsApi
@@ -20,21 +22,27 @@ from hotdata.exceptions import ApiException
 from hotdata.models.add_managed_table_request import AddManagedTableRequest
 from hotdata.models.async_query_response import AsyncQueryResponse
 from hotdata.models.create_database_request import CreateDatabaseRequest
+from hotdata.models.create_index_request import CreateIndexRequest
 from hotdata.models.database_default_schema_decl import DatabaseDefaultSchemaDecl
 from hotdata.models.database_default_table_decl import DatabaseDefaultTableDecl
+from hotdata.models.index_info_response import IndexInfoResponse
+from hotdata.models.job_status_response import JobStatusResponse
 from hotdata.models.load_managed_table_request import LoadManagedTableRequest
 from hotdata.models.query_request import QueryRequest
 from hotdata.models.query_response import QueryResponse
+from hotdata.models.submit_job_response import SubmitJobResponse
 from hotdata.models.table_info import TableInfo
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
 from urllib3.exceptions import ProtocolError
 
 from hotdata_framework.databases import (
     DEFAULT_SCHEMA,
+    CreateIndexResult,
     LoadManagedTableResult,
     ManagedDatabase,
     ManagedTable,
     api_error_message,
+    enum_value,
     is_parquet_path,
     managed_database_from_detail,
 )
@@ -52,8 +60,24 @@ from hotdata_framework.result import QueryResult
 # rows, delete/update/upsert match by the table's declared key.
 ManagedLoadMode = Literal["replace", "append", "delete", "update", "upsert"]
 
+# Index kinds the indexes endpoint accepts. "sorted" is the server-side default;
+# "bm25" backs full-text search and "vector" backs nearest-neighbour search.
+IndexType = Literal["sorted", "bm25", "vector"]
+
+# Distance metrics a vector index can be built with. Each one accelerates
+# exactly one query function: cosine -> cosine_distance, l2 -> l2_distance,
+# dot -> negative_dot_product. A hand-written query naming a different function
+# falls back to a full scan; the provider-backed vector_distance path resolves
+# the function from the index instead, so it cannot mismatch.
+VectorMetric = Literal["l2", "cosine", "dot"]
+
+_INDEX_TYPES = frozenset({"sorted", "bm25", "vector"})
+_VECTOR_METRICS = frozenset({"l2", "cosine", "dot"})
+
 _TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 _RESULT_FAILURE = frozenset({"failed", "cancelled"})
+# Jobs have no "cancelled" state; "partially_succeeded" carries an error_message.
+_JOB_TERMINAL = frozenset({"succeeded", "partially_succeeded", "failed"})
 
 
 @dataclass(frozen=True)
@@ -187,6 +211,12 @@ class HotdataClient:
 
     def _information_schema(self) -> InformationSchemaApi:
         return InformationSchemaApi(self._api)
+
+    def _indexes_api(self) -> IndexesApi:
+        return IndexesApi(self._api)
+
+    def _jobs_api(self) -> JobsApi:
+        return JobsApi(self._api)
 
     def _query_api(self) -> QueryApi:
         return QueryApi(self._api)
@@ -427,6 +457,200 @@ class HotdataClient:
         except ApiException as e:
             raise RuntimeError(api_error_message(e)) from e
 
+    def create_index(
+        self,
+        database: str | ManagedDatabase,
+        table: str,
+        *,
+        schema: str = DEFAULT_SCHEMA,
+        index_name: str | None = None,
+        columns: list[str],
+        index_type: IndexType,
+        metric: VectorMetric | None = None,
+        dimensions: int | None = None,
+        embedding_provider_id: str | None = None,
+        output_column: str | None = None,
+        description: str | None = None,
+        wait: bool = True,
+        timeout_s: float = 300.0,
+        poll_interval_s: float = 2.0,
+    ) -> CreateIndexResult:
+        """Build an index on a managed table and wait for it to be ready.
+
+        The Python equivalent of ``hotdata indexes create``, scoped to managed
+        databases. Indexing a table on a plain (non-managed) connection is not
+        supported here; the CLI's ``--catalog`` flag covers that case.
+
+        ``index_type`` selects the index kind and is required: ``"bm25"`` for
+        full-text search (queries error outright without one), ``"vector"`` for
+        nearest-neighbour search (queries work without one, but only at
+        full-scan speed), or ``"sorted"``. The API defaults an unspecified kind
+        to ``"sorted"``; this method makes the choice explicit instead, because
+        the wrong kind fails at query time rather than here.
+
+        ``index_name`` defaults to ``{table}_{columns}_{index_type}``, the same
+        derivation the CLI uses when ``--name`` is omitted, so both surfaces
+        name the same index identically.
+
+        There are two kinds of vector index, and they are queried differently:
+
+        * **Plain** — omit ``embedding_provider_id``. ``columns`` is the existing
+          vector column (a float list), and a query passes a literal vector:
+          ``cosine_distance(col, ARRAY[...])``. Here ``metric`` must match the
+          distance function the caller writes — ``cosine`` serves
+          ``cosine_distance``, ``l2`` serves ``l2_distance``, ``dot`` serves
+          ``negative_dot_product``. A mismatch is not an error: the query
+          silently reverts to a full table scan. Omitting ``metric`` lets the
+          server choose (``l2`` for float-array columns), so pass it explicitly
+          whenever the query function is known.
+        * **Provider-backed** — set ``embedding_provider_id`` (e.g. the system
+          provider ``sys_emb_openai``). ``columns`` is then the *source text*
+          column; the provider embeds it into ``output_column`` (default
+          ``{column}_embedding``) and the index is built over that. A query
+          passes text, not a vector — ``vector_distance(source_col, 'query')`` —
+          and the server resolves the matching distance function from the index
+          itself, so the metric-mismatch trap above does not apply. The returned
+          ``source_column`` names the column to query.
+
+        ``dimensions`` picks the output width for providers that support several;
+        it does not apply when indexing an existing vector column, whose width is
+        read from the data. A vector index takes exactly one column.
+
+        The server builds the index as a background job. This method polls that
+        job to a terminal state and raises ``RuntimeError`` if it failed, because
+        the submit call itself reports success for builds that later fail. Pass
+        ``wait=False`` to return as soon as the job is accepted — the result then
+        carries ``status="pending"`` and a ``job_id``, and the caller owns
+        checking the outcome (the CLI's ``--async`` plus ``hotdata jobs``).
+
+        Raises ``ValueError`` for an unusable argument combination,
+        ``RuntimeError`` if the API rejects the request or the build fails, and
+        ``TimeoutError`` if the build is still running after ``timeout_s``.
+        """
+        if not columns:
+            raise ValueError("create_index requires at least one column")
+        if index_type not in _INDEX_TYPES:
+            allowed = ", ".join(sorted(_INDEX_TYPES))
+            raise ValueError(f"index_type must be one of {allowed} (got {index_type!r})")
+        if index_type != "vector":
+            vector_only = {
+                "metric": metric,
+                "dimensions": dimensions,
+                "embedding_provider_id": embedding_provider_id,
+                "output_column": output_column,
+                "description": description,
+            }
+            supplied = sorted(k for k, v in vector_only.items() if v is not None)
+            if supplied:
+                raise ValueError(
+                    f"{', '.join(supplied)} appl{'ies' if len(supplied) == 1 else 'y'} to "
+                    f"vector indexes only (index_type={index_type!r})"
+                )
+        else:
+            if len(columns) != 1:
+                raise ValueError(
+                    f"a vector index takes exactly one column (got {len(columns)}); "
+                    "the engine indexes only the first"
+                )
+            if metric is not None and metric not in _VECTOR_METRICS:
+                allowed = ", ".join(sorted(_VECTOR_METRICS))
+                raise ValueError(f"metric must be one of {allowed} (got {metric!r})")
+
+        # Matches the CLI's derivation so both surfaces name the same index
+        # identically: `hotdata indexes create` without --name.
+        resolved_name = index_name or f"{table}_{'_'.join(columns)}_{index_type}"
+
+        db = self._as_managed_database(database)
+        request = CreateIndexRequest(
+            index_name=resolved_name,
+            columns=list(columns),
+            index_type=index_type,
+            metric=metric,
+            dimensions=dimensions,
+            embedding_provider_id=embedding_provider_id,
+            output_column=output_column,
+            description=description,
+            var_async=True,
+        )
+        try:
+            submitted = self._indexes_api().create_index(
+                db.default_connection_id,
+                schema,
+                table,
+                request,
+            )
+        except ApiException as e:
+            raise RuntimeError(api_error_message(e)) from e
+
+        full_name = f"{db.id}.{schema}.{table}"
+
+        # A build the server finished inline answers 201 with the index itself;
+        # the async path answers 202 with a job to poll.
+        if isinstance(submitted, IndexInfoResponse):
+            return self._index_result(submitted, full_name, schema, table, job_id=None)
+
+        if not isinstance(submitted, SubmitJobResponse):
+            raise RuntimeError(f"Unexpected create_index response type: {type(submitted)!r}")
+
+        job_id = submitted.id
+        if not wait:
+            return CreateIndexResult(
+                full_name=full_name,
+                schema_name=schema,
+                table_name=table,
+                index_name=resolved_name,
+                index_type=index_type,
+                columns=list(columns),
+                metric=metric,
+                source_column=columns[0] if embedding_provider_id else None,
+                status="pending",
+                job_id=job_id,
+            )
+
+        job = self._poll_job(job_id, timeout_s=timeout_s, interval_s=poll_interval_s)
+        status = enum_value(job.status)
+        if status != "succeeded":
+            detail = job.error_message or f"Index build {status}"
+            raise RuntimeError(f"Index {resolved_name!r} on {full_name}: {detail}")
+
+        built = job.result.actual_instance if job.result is not None else None
+        if isinstance(built, IndexInfoResponse):
+            return self._index_result(built, full_name, schema, table, job_id=job_id)
+        return CreateIndexResult(
+            full_name=full_name,
+            schema_name=schema,
+            table_name=table,
+            index_name=resolved_name,
+            index_type=index_type,
+            columns=list(columns),
+            metric=metric,
+            source_column=columns[0] if embedding_provider_id else None,
+            status="ready",
+            job_id=job_id,
+        )
+
+    @staticmethod
+    def _index_result(
+        info: IndexInfoResponse,
+        full_name: str,
+        schema: str,
+        table: str,
+        *,
+        job_id: str | None,
+    ) -> CreateIndexResult:
+        return CreateIndexResult(
+            full_name=full_name,
+            schema_name=schema,
+            table_name=table,
+            index_name=info.index_name,
+            index_type=info.index_type,
+            columns=list(info.columns),
+            metric=info.metric,
+            source_column=info.source_column,
+            status=enum_value(info.status),
+            job_id=job_id,
+        )
+
     def list_recent_results(
         self,
         *,
@@ -558,6 +782,29 @@ class HotdataClient:
         raise TimeoutError(
             f"Query run {query_run_id} did not finish within {timeout_s}s "
             f"(last status: {getattr(last, 'status', None)})"
+        )
+
+    def _poll_job(
+        self,
+        job_id: str,
+        *,
+        timeout_s: float = 300.0,
+        interval_s: float = 2.0,
+    ) -> JobStatusResponse:
+        jobs = self._jobs_api()
+        deadline = time.monotonic() + timeout_s
+        last: JobStatusResponse | None = None
+        while time.monotonic() < deadline:
+            try:
+                last = jobs.get_job(job_id)
+            except ApiException as e:
+                raise RuntimeError(api_error_message(e)) from e
+            if last.status in _JOB_TERMINAL:
+                return last
+            time.sleep(interval_s)
+        last_status = enum_value(last.status) if last is not None else None
+        raise TimeoutError(
+            f"Job {job_id} did not finish within {timeout_s}s (last status: {last_status})"
         )
 
     def _wait_result_ready(

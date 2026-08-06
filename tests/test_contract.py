@@ -11,6 +11,7 @@ from hotdata_framework.result import QueryResult
 def test_public_exports_contract():
     assert hr.__all__ == [
         "DEFAULT_SCHEMA",
+        "CreateIndexResult",
         "HotdataClient",
         "HotdataError",
         "HotdataTerminalError",

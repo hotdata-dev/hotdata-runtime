@@ -12,56 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `create_index(database, table, columns=..., index_type=...)` builds an index on a
-  managed table, bringing the framework client to parity with `hotdata indexes
-  create` in the CLI. It covers all three index kinds the API accepts: `"bm25"` for
-  full-text search, `"vector"` for nearest-neighbour search, and `"sorted"`.
-  Previously the framework had no index API at all and callers had to drop to the raw
-  `hotdata.IndexesApi`, which left a managed database's data loaded but not
-  searchable: full-text queries error without an index, and vector queries run at
-  full-scan speed. Like the other managed-table operations, `database` accepts a
-  name/id or an already-resolved `ManagedDatabase`. Indexing a table on a plain
-  (non-managed) connection is not covered — the CLI's `--catalog` handles that.
-
-  `index_name` is optional and defaults to `{table}_{columns}_{index_type}`, the same
-  derivation the CLI uses when `--name` is omitted, so both surfaces name the same
-  index identically. `index_type` is required, unlike the API's `"sorted"` default,
-  because the wrong kind only fails at query time.
-
-  The server builds the index as a background job whose submit call reports success
-  even when the build later fails, so `create_index` polls the job to a terminal
-  state and raises `RuntimeError` carrying the job's `error_message`. Pass
-  `wait=False` to return once the job is accepted (`status="pending"` plus a
-  `job_id`) and own the outcome check yourself, as the CLI's `--async` does;
-  `timeout_s` and `poll_interval_s` tune the wait.
-
-  Both vector-index modes are supported. Omitting `embedding_provider_id` indexes an
-  existing vector column, queried with a literal vector — and there `metric` must
-  match the distance function the query uses (`cosine`→`cosine_distance`,
-  `l2`→`l2_distance`, `dot`→`negative_dot_product`), since a mismatch silently
-  reverts to a full table scan rather than erroring. Setting
-  `embedding_provider_id` indexes a *text* column instead: the provider embeds it
-  into `output_column`, queries pass text via `vector_distance(source_col, 'query')`,
-  and the server resolves the distance function itself.
-
-  Argument combinations that the server would silently ignore raise `ValueError`
-  before any request is sent: an unknown `index_type` or `metric`, a vector index
-  with more than one column (the engine indexes only the first), and
-  `metric`/`dimensions`/`embedding_provider_id`/`output_column`/`description` on a
-  non-vector index.
-
-  Verified against `api.hotdata.dev` when this version was released: BM25 and vector
-  indexes both build and report `ready`, and a BM25 index is used by full-text
-  search. A *vector* index on a managed database was **not** picked up by the query
-  planner at that time — a matching `cosine_distance(...) ORDER BY ... LIMIT k` still
-  planned as a full scan. That reproduces with an index created by `hotdata indexes
-  create`, so it is an engine-side issue rather than a client one, but it means a
-  vector index built through this method may not yet accelerate queries.
-
-- `CreateIndexResult`, the frozen dataclass `create_index` returns, is exported from
-  `hotdata_framework` and added to the public contract surface. Its `source_column`
-  names the text column to query for a provider-backed vector index, and is `None`
-  for BM25, sorted, and plain vector indexes.
+- `create_index(database, table, columns=..., index_type=...)` builds a `bm25`,
+  `vector`, or `sorted` index on a managed table, matching `hotdata indexes create`
+  in the CLI. The build is a background job whose submit call reports success even
+  when the build later fails, so this polls the job and raises `RuntimeError` with
+  its error message; `wait=False` returns as soon as the job is accepted. Returns
+  `CreateIndexResult`, also exported.
 
 ## [0.9.0] - 2026-07-23
 

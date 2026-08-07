@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
-## [0.10.0] - 2026-08-06
+## [0.10.0] - 2026-08-07
 
 ### Added
 
@@ -49,6 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with more than one column (the engine indexes only the first), and
   `metric`/`dimensions`/`embedding_provider_id`/`output_column`/`description` on a
   non-vector index.
+
+  Verified against `api.hotdata.dev` when this version was released: BM25 and vector
+  indexes both build and report `ready`, and a BM25 index is used by full-text
+  search. A *vector* index on a managed database was **not** picked up by the query
+  planner at that time — a matching `cosine_distance(...) ORDER BY ... LIMIT k` still
+  planned as a full scan. That reproduces with an index created by `hotdata indexes
+  create`, so it is an engine-side issue rather than a client one, but it means a
+  vector index built through this method may not yet accelerate queries.
 
 - `CreateIndexResult`, the frozen dataclass `create_index` returns, is exported from
   `hotdata_framework` and added to the public contract surface. Its `source_column`

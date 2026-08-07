@@ -292,6 +292,53 @@ def test_create_index_wait_false_returns_pending_without_polling():
     assert result.columns == ["body"]
 
 
+def test_wait_false_reports_the_server_status_rather_than_assuming_pending():
+    """The server states the accepted job's status; don't hardcode it."""
+    client = _client()
+    submitted = SubmitJobResponse(id="job_2", status=JobStatus.RUNNING, status_url="/v1/jobs/job_2")
+    indexes = FakeIndexesApi(submitted)
+    jobs = FakeJobsApi([_job(JobStatus.SUCCEEDED)])
+
+    with (
+        patch.object(client, "_indexes_api", return_value=indexes),
+        patch.object(client, "_jobs_api", return_value=jobs),
+    ):
+        result = client.create_index(
+            _db(),
+            "docs",
+            columns=["body"],
+            index_type="bm25",
+            wait=False,
+        )
+
+    assert jobs.calls == 0
+    assert result.status == "running"
+
+
+def test_job_result_carrying_the_index_directly_is_still_read():
+    """`result` is a oneOf wrapper today; a bare model must not raise."""
+    client = _client()
+    indexes = FakeIndexesApi(_submitted())
+    built = _index_info(index_name="docs_body_bm25", index_type="bm25", metric=None)
+    # No `.actual_instance` — the model sits directly on `result`.
+    jobs = FakeJobsApi([_job(JobStatus.SUCCEEDED, result=built)])
+
+    with (
+        patch.object(client, "_indexes_api", return_value=indexes),
+        patch.object(client, "_jobs_api", return_value=jobs),
+    ):
+        result = client.create_index(
+            _db(),
+            "docs",
+            columns=["body"],
+            index_type="bm25",
+            poll_interval_s=0,
+        )
+
+    assert result.status == "ready"
+    assert result.index_name == "docs_body_bm25"
+
+
 def test_create_index_accepts_an_inline_201_response():
     """A build the server finishes inline answers with the index itself, not a job."""
     client = _client()

@@ -56,12 +56,16 @@ class CreateIndexResult:
     owns checking the job's outcome.
 
     ``source_column`` is set only for an embedding-backed vector index, where it
-    names the *text* column a query passes to ``vector_distance(col, 'text')``;
-    ``columns`` then holds the generated embedding column instead. It is ``None``
-    for BM25, sorted, and plain (existing-vector-column) indexes.
+    names the *text* column a query passes to ``vector_distance(col, 'text')``.
+    It is ``None`` for BM25, sorted, and plain (existing-vector-column) indexes.
 
-    ``index_type``, ``columns``, and ``metric`` echo the requested values when
-    the server does not return the built index alongside the finished job.
+    ``index_type``, ``columns``, and ``metric`` echo the requested values when the
+    server does not return the built index alongside the finished job — that is,
+    on the ``wait=False`` path and when a finished job carries no index payload.
+    Only when the server did return it does ``columns`` hold the *generated*
+    embedding column for an embedding-backed index; on the echoing paths
+    ``columns[0]`` is the source text column, the same value as
+    ``source_column``. Read ``status`` to tell the cases apart.
     """
 
     full_name: str

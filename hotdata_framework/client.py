@@ -4,7 +4,7 @@ import functools
 import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from hotdata import ApiClient, Configuration
 from hotdata.api.connections_api import ConnectionsApi
@@ -71,8 +71,8 @@ IndexType = Literal["sorted", "bm25", "vector"]
 # the function from the index instead, so it cannot mismatch.
 VectorMetric = Literal["l2", "cosine", "dot"]
 
-_INDEX_TYPES = frozenset({"sorted", "bm25", "vector"})
-_VECTOR_METRICS = frozenset({"l2", "cosine", "dot"})
+_INDEX_TYPES = frozenset(get_args(IndexType))
+_VECTOR_METRICS = frozenset(get_args(VectorMetric))
 
 _TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 _RESULT_FAILURE = frozenset({"failed", "cancelled"})
@@ -514,7 +514,10 @@ class HotdataClient:
 
         ``dimensions`` picks the output width for providers that support several;
         it does not apply when indexing an existing vector column, whose width is
-        read from the data. A vector index takes exactly one column.
+        read from the data. ``description`` is a user-facing label for the
+        embedding (e.g. ``"product descriptions"``), stored alongside it. A vector
+        index takes exactly one column, and every option in this paragraph — plus
+        ``metric`` — is rejected for a non-vector ``index_type``, matching the CLI.
 
         The server builds the index as a background job. This method polls that
         job to a terminal state and raises ``RuntimeError`` if it failed, because
@@ -593,7 +596,10 @@ class HotdataClient:
             raise RuntimeError(f"Unexpected create_index response type: {type(submitted)!r}")
 
         job_id = submitted.id
-        if not wait:
+
+        def requested_result(status: str) -> CreateIndexResult:
+            """Echo the requested values, for the paths where the server hands
+            back a job rather than the built index."""
             return CreateIndexResult(
                 full_name=full_name,
                 schema_name=schema,
@@ -603,9 +609,12 @@ class HotdataClient:
                 columns=list(columns),
                 metric=metric,
                 source_column=columns[0] if embedding_provider_id else None,
-                status="pending",
+                status=status,
                 job_id=job_id,
             )
+
+        if not wait:
+            return requested_result(enum_value(submitted.status))
 
         job = self._poll_job(job_id, timeout_s=timeout_s, interval_s=poll_interval_s)
         status = enum_value(job.status)
@@ -613,21 +622,11 @@ class HotdataClient:
             detail = job.error_message or f"Index build {status}"
             raise RuntimeError(f"Index {resolved_name!r} on {full_name}: {detail}")
 
-        built = job.result.actual_instance if job.result is not None else None
+        # `result` is a oneOf wrapper today; tolerate the model arriving directly.
+        built = getattr(job.result, "actual_instance", job.result)
         if isinstance(built, IndexInfoResponse):
             return self._index_result(built, full_name, schema, table, job_id=job_id)
-        return CreateIndexResult(
-            full_name=full_name,
-            schema_name=schema,
-            table_name=table,
-            index_name=resolved_name,
-            index_type=index_type,
-            columns=list(columns),
-            metric=metric,
-            source_column=columns[0] if embedding_provider_id else None,
-            status="ready",
-            job_id=job_id,
-        )
+        return requested_result("ready")
 
     @staticmethod
     def _index_result(

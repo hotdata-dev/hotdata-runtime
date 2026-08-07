@@ -10,6 +10,7 @@ from hotdata_framework.client import (
 )
 from hotdata_framework.databases import (
     DEFAULT_SCHEMA,
+    CreateIndexResult,
     LoadManagedTableResult,
     ManagedDatabase,
     ManagedTable,
@@ -43,6 +44,7 @@ except PackageNotFoundError:
 
 __all__ = [
     "DEFAULT_SCHEMA",
+    "CreateIndexResult",
     "HotdataClient",
     "HotdataError",
     "HotdataTerminalError",

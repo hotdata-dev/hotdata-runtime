@@ -16,6 +16,7 @@ Runtime boundary and guarantees are defined in `CONTRACT.md`.
 - **Result utilities** — convert query results to records, pandas DataFrames, or metadata dictionaries for adapter display layers.
 - **History helpers** — list recent results and query run history with normalized dataclasses.
 - **Managed databases** — create Hotdata-owned catalogs, declare tables, upload parquet, and load managed tables (mirrors `hotdata databases` in the CLI).
+- **Indexes** — build BM25, vector, or sorted indexes on managed tables, mirroring `hotdata indexes create` (managed databases only). Waits on the background build job and surfaces its failure, instead of reporting the phantom success the submit call returns.
 - **Health helpers** — build compact API/workspace health summaries for UI integrations.
 
 Install:

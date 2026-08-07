@@ -33,6 +33,7 @@ The supported import surface is:
 - `ManagedDatabase`
 - `ManagedTable`
 - `LoadManagedTableResult`
+- `CreateIndexResult`
 - `DEFAULT_SCHEMA`
 - `is_parquet_path`
 
@@ -63,7 +64,8 @@ Adapters should import from `hotdata_framework` and treat this surface as the st
 - `upload_parquet(path)` uploads a local parquet file and returns an upload id.
 - `load_managed_table(database, table, schema=..., upload_id=..., file=...)` publishes parquet data into a declared managed table.
 - `delete_managed_table(database, table, schema=...)` deletes a managed table.
-- The `database` argument of `list_managed_tables`, `load_managed_table`, `add_managed_table`, `delete_managed_table`, `delete_managed_database`, and `execute_sql` accepts a name/id **or** an already-resolved `ManagedDatabase`. Passing a `ManagedDatabase` skips the name/id read probe, so a create-scoped key that cannot read `/databases` can load into a database it just created.
+- `create_index(database, table, schema=..., columns=..., index_type=..., index_name=...)` builds a `"sorted"`, `"bm25"`, or `"vector"` index on a managed table and returns a `CreateIndexResult`. It is the framework-side equivalent of the CLI's `hotdata indexes create`; indexing a table on a plain (non-managed) connection is out of scope. `index_name` defaults to `{table}_{columns}_{index_type}`, matching the CLI's derivation when `--name` is omitted. `index_type` is required rather than defaulting to the API's `"sorted"`. The build runs as a background job; the call polls it to a terminal state and raises `RuntimeError` with the job's `error_message` when it fails, because the submit call reports success regardless. `wait=False` returns as soon as the job is accepted, with `status="pending"` and a `job_id` for the caller to poll. For `index_type="vector"`, omitting `embedding_provider_id` indexes an existing vector column and `metric` (`"l2"`, `"cosine"`, `"dot"`) selects the distance function the index accelerates — a query using a different function silently falls back to a full scan; setting `embedding_provider_id` indexes a source *text* column instead, and the returned `source_column` names the column to pass to `vector_distance`. Argument combinations the server would silently ignore raise `ValueError` before any request is sent.
+- The `database` argument of `list_managed_tables`, `load_managed_table`, `add_managed_table`, `delete_managed_table`, `delete_managed_database`, `create_index`, and `execute_sql` accepts a name/id **or** an already-resolved `ManagedDatabase`. Passing a `ManagedDatabase` skips the name/id read probe, so a create-scoped key that cannot read `/databases` can load into a database it just created.
 
 ### `QueryResult`
 

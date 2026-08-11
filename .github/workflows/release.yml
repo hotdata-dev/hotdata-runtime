@@ -25,6 +25,24 @@ jobs:
       # The tag being released, whether it arrived by push or by dispatch.
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
+      # Before checkout, because checkout resolves the input as an arbitrary ref
+      # — and this workflow needs the guard more than publish.yml does. It holds
+      # `contents: write`, and action-gh-release CREATES a tag when tag_name does
+      # not resolve to one, so an unvalidated `tag: main` would check out cleanly
+      # and leave refs/tags/main plus a release named for it. The push path is
+      # constrained by the v[0-9]* filter; the dispatch path was not constrained
+      # at all.
+      - name: Validate release tag format
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag must look like vX.Y.Z, got: $INPUT_TAG" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.tag || github.ref_name }}

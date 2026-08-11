@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - 'v[0-9]*'
+  # RELEASING.md already documents this recovery path — "If PyPI publish
+  # succeeded but the GitHub Release workflow failed, rerun it from main without
+  # retagging" — but the trigger it needs was never here, so the documented
+  # command has always failed. Adding it makes the doc true.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to create or update a Release for (e.g. v1.2.3)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,8 +22,13 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    env:
+      # The tag being released, whether it arrived by push or by dispatch.
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
@@ -23,7 +38,7 @@ jobs:
         id: meta
         run: |
           pkg_name=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['name'])")
-          pkg_version="${GITHUB_REF_NAME#v}"
+          pkg_version="${TAG#v}"
           echo "name=${pkg_name}" >> "$GITHUB_OUTPUT"
           echo "version=${pkg_version}" >> "$GITHUB_OUTPUT"
 
@@ -31,7 +46,7 @@ jobs:
         id: notes
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${TAG#v}"
           if [[ -f CHANGELOG.md ]]; then
             body="$(python scripts/extract-changelog.py "$version")"
           else
@@ -47,7 +62,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
           name: ${{ steps.meta.outputs.name }} ${{ steps.meta.outputs.version }}
           body: ${{ steps.notes.outputs.body }}
           generate_release_notes: false

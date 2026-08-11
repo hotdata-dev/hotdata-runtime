@@ -7,7 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-
 ## [0.11.0] - 2026-08-11
 
 ### Changed
@@ -44,10 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signatures — a `session_id=` parameter, a `session_id` metadata key — need to
   remove it from theirs too, which makes their own release breaking in turn.
 
-
 - `hotdata_framework.http` and `default_http_retries()`. The module existed only
-  to build the retry policy above and had no other callers. It predates
-  `hotdata._retry`, which supersedes it.
+  to build the `retries=` policy removed under Fixed below, and had no other
+  callers. It predates `hotdata._retry`, which supersedes it.
 
 ### Fixed
 

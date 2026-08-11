@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+
+## [0.11.0] - 2026-08-11
+
 ### Changed
 
 - Cap the `hotdata` dependency to the current minor (`>=0.8.0,<0.9`). This
@@ -40,7 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the workspace helpers. Adapters that re-export session context in their own
   signatures — a `session_id=` parameter, a `session_id` metadata key — need to
   remove it from theirs too, which makes their own release breaking in turn.
-
 
 ## [0.10.0] - 2026-08-07
 

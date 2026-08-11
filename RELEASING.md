@@ -45,9 +45,10 @@ gh workflow run "Publish to PyPI" --ref main -f tag=vX.Y.Z
 gh workflow run "GitHub Release"  --ref main -f tag=vX.Y.Z
 ```
 
-`--ref main` selects the workflow *definition* (so it picks up any fix landed
-since the tag); the `tag` input selects what gets built and released. The two
-refs serve different purposes, which is why they can differ.
+`--ref main` selects the workflow *definition*, so a fix to the workflow file
+itself is picked up; everything it runs — including `scripts/extract-changelog.py`
+— still comes from the tag, since that is what is being built and released. The
+two refs serve different purposes, which is why they can differ.
 
 A version is only spent once PyPI has accepted an upload. If the publish failed
 before that, the same version can still be published — check with

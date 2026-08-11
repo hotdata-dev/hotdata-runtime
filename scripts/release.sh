@@ -7,6 +7,31 @@ cd "$ROOT"
 die() { echo "error: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
 
+# An interpreter that can `import tomllib` — stdlib only from 3.11, while
+# `python3` on macOS is still 3.9. Hardcoding `python3` made every step below
+# fail with a bare ModuleNotFoundError, which reads as a broken checkout rather
+# than a too-old interpreter, and it failed at the FIRST step so nothing was
+# half-done. Resolved once here rather than per call site.
+#
+# `uv` is the fallback because this repo already builds and tests through it, so
+# a machine that can run the suite can run the release.
+resolve_python() {
+  if command -v python3 >/dev/null 2>&1 && python3 -c "import tomllib" >/dev/null 2>&1; then
+    echo python3
+  elif command -v uv >/dev/null 2>&1; then
+    echo "uv run --no-project --python 3.12 python"
+  else
+    die "need python3 >= 3.11 (for tomllib) or uv; python3 is $(command -v python3 >/dev/null 2>&1 && python3 -V 2>&1 || echo absent)"
+  fi
+}
+
+# Deferred, not resolved at load: the commands that never touch Python must keep
+# working without a usable interpreter — otherwise the message telling you which
+# interpreter you need is itself gated on having it, and `--help` breaks on
+# exactly the machine this resolution exists for. Empty default satisfies `set -u`
+# if a helper is ever reached by another path.
+PY_BIN=""
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -24,7 +49,7 @@ EOF
 }
 
 get_version() {
-  python3 - <<'PY'
+  $PY_BIN - <<'PY'
 import tomllib
 from pathlib import Path
 print(tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"])
@@ -32,7 +57,7 @@ PY
 }
 
 get_pkg_name() {
-  python3 - <<'PY'
+  $PY_BIN - <<'PY'
 import tomllib
 from pathlib import Path
 print(tomllib.loads(Path("pyproject.toml").read_text())["project"]["name"])
@@ -41,7 +66,7 @@ PY
 
 set_version() {
   local ver="$1"
-  python3 - "$ver" <<'PY'
+  $PY_BIN - "$ver" <<'PY'
 import re, sys
 from pathlib import Path
 ver = sys.argv[1]
@@ -56,7 +81,7 @@ PY
 
 bump_version() {
   local kind="$1" current="$2"
-  python3 - "$kind" "$current" <<'PY'
+  $PY_BIN - "$kind" "$current" <<'PY'
 import re, sys
 kind, current = sys.argv[1], sys.argv[2]
 match = re.match(r"^(\d+)\.(\d+)\.(\d+)(.*)$", current)
@@ -95,14 +120,14 @@ update_changelog() {
   local ver="$1"
   local date
   date="$(date +%Y-%m-%d)"
-  python3 scripts/update_changelog.py "$ver" "$date"
+  $PY_BIN scripts/update_changelog.py "$ver" "$date"
 }
 
 cmd_prepare() {
+  PY_BIN="$(resolve_python)"
   local bump="${1:-}"
   [[ -n "$bump" ]] || { usage; die "missing bump kind or explicit version"; }
   need gh
-  need python3
   ensure_clean
 
   local current new base branch pkg
@@ -150,8 +175,8 @@ After merge, run \`./scripts/release.sh publish\` from a clean \`${base}\` check
 }
 
 cmd_publish() {
+  PY_BIN="$(resolve_python)"
   need gh
-  need python3
   ensure_clean
 
   local base ver tag
@@ -166,7 +191,7 @@ cmd_publish() {
 
   git rev-parse "$tag" >/dev/null 2>&1 && die "tag $tag already exists"
   [[ -f CHANGELOG.md ]] || die "CHANGELOG.md is required"
-  python3 - "$ver" <<'PY'
+  $PY_BIN - "$ver" <<'PY'
 import re, sys
 from pathlib import Path
 ver = sys.argv[1]

@@ -52,7 +52,6 @@ from hotdata_framework.env import (
     normalize_host,
     pick_workspace,
 )
-from hotdata_framework.http import default_http_retries
 from hotdata_framework.result import QueryResult
 
 # Load modes the managed-table endpoint accepts: replace overwrites, append adds
@@ -154,11 +153,16 @@ class HotdataClient:
         self._host = normalize_host(host) if host else default_host()
         self._api_key = api_key
         self._workspace_id = workspace_id
+        # No `retries=`: the generated SDK's own default is the correct policy
+        # and passing one here replaces it wholesale. `hotdata._retry` retries a
+        # pre-response connection reset on any method — the stale pooled socket
+        # case this wrapper was reaching for — while leaving read timeouts and
+        # status retries idempotent-only, so a POST that may have reached the
+        # server is never replayed.
         self._config = Configuration(
             host=self._host,
             api_key=api_key,
             workspace_id=workspace_id,
-            retries=default_http_retries(),
         )
         self._api = ApiClient(self._config)
         if request_timeout is not None:

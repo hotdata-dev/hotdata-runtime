@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Table storage layout, both directions. `add_managed_table()` and
+  `create_managed_database()` take `partition_by` / `sorted_by`, and
+  `managed_table_layout()` reads back what was actually declared as a
+  `TableLayout`. `TablePartitionKey` and `TableSortKey` are re-exported so
+  callers need one import.
+
+  Both halves matter because a layout is fixed when the table is created and
+  there is no alter path: a table declared without one keeps that shape until it
+  is recreated and its data rewritten. So declaring is not enough — a caller has
+  to be able to confirm it took, and to refuse to load when it cannot.
+
+  `managed_table_layout()` raises `KeyError` for a table that is not declared,
+  rather than returning an empty layout. "Not there" and "declared without a
+  layout" lead to opposite decisions for a caller.
+
+  Until now this package could not express a layout at all, which is why at least
+  one consumer hand-built the HTTP request instead. The generated key models are
+  passed through rather than wrapped, so the transform vocabulary stays exactly
+  the API's.
+
+### Changed
+
+- Require `hotdata>=0.9.0,<0.10`. 0.9.0 is the first release whose models carry
+  `partition_by` / `sorted_by` on the add-table request, the create-database
+  table declarations, and the table-info response. On an older `hotdata` the
+  fields would be silently dropped by the model and the table declared without a
+  layout, returning success — which is the failure this feature exists to end.
+
 ## [0.11.0] - 2026-08-11
 
 ### Changed

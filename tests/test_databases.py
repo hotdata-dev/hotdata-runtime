@@ -9,9 +9,12 @@ from hotdata.models.database_default_table_decl import DatabaseDefaultTableDecl
 
 from hotdata_framework.client import HotdataClient
 from hotdata_framework.databases import (
+    ManagedDatabase,
     is_parquet_path,
     managed_database_from_detail,
 )
+
+_MANAGED_DB = ManagedDatabase(id="db_1", description="d", default_connection_id="conn_1")
 
 
 def _decl_key_supported() -> bool:
@@ -383,3 +386,173 @@ class _Any:
 
     def __eq__(self, other: object) -> bool:
         return True
+
+
+# ---------------------------------------------------------------------------
+# Table layout: declaring it, and reading it back
+#
+# A layout is fixed when the table is created and there is no alter path, so a
+# silently dropped argument produces a table that can never be repaired — only
+# recreated with its data rewritten. That is why these assert on the REQUEST
+# object reaching the API rather than on the call succeeding: the generated model
+# ignores unknown fields, so passing `partition_by=` to a client whose model
+# lacks it returns 201 and declares a layout-less table. That exact silent drop
+# is why this package could not express a layout until now.
+
+
+def _layout():
+    from hotdata_framework import TablePartitionKey, TableSortKey
+
+    return (
+        [TablePartitionKey(column="event_date", transform="identity")],
+        [TableSortKey(column="event_time", direction="desc", nulls="last")],
+    )
+
+
+def test_add_managed_table_sends_the_layout():
+
+    parts, sorts = _layout()
+    client = _client()
+    captured = {}
+
+    class FakeDatabasesApi:
+        def add_database_table(self, db_id, schema, request):
+            captured["request"] = request
+            captured["schema"] = schema
+
+    with patch.object(client, "_databases_api", return_value=FakeDatabasesApi()), patch.object(
+        client, "_as_managed_database", return_value=_MANAGED_DB
+    ):
+        client.add_managed_table("db_1", "files", key=["id"], partition_by=parts, sorted_by=sorts)
+
+    req = captured["request"]
+    # Serialised, because that is what actually goes on the wire — a field the
+    # model does not know about vanishes here rather than at the call site.
+    body = req.to_dict()
+    assert body["partition_by"] == [{"column": "event_date", "transform": "identity"}]
+    assert body["sorted_by"] == [{"column": "event_time", "direction": "desc", "nulls": "last"}]
+    assert body["key"] == ["id"]
+
+
+def test_add_managed_table_omits_layout_when_not_asked():
+    """Omitted must stay omitted: sending empty arrays would declare "explicitly
+    no layout" on a server that distinguishes absent from empty."""
+
+    client = _client()
+    captured = {}
+
+    class FakeDatabasesApi:
+        def add_database_table(self, db_id, schema, request):
+            captured["request"] = request
+
+    with patch.object(client, "_databases_api", return_value=FakeDatabasesApi()), patch.object(
+        client, "_as_managed_database", return_value=_MANAGED_DB
+    ):
+        client.add_managed_table("db_1", "files")
+
+    body = captured["request"].to_dict()
+    assert body.get("partition_by") is None
+    assert body.get("sorted_by") is None
+
+
+def test_create_managed_database_sends_per_table_layout():
+
+    parts, sorts = _layout()
+    client = _client()
+    captured = {}
+
+    class FakeDatabasesApi:
+        def create_database(self, request):
+            captured["request"] = request
+            return _detail(id="db_new", description="demo")
+
+    with patch.object(client, "_databases_api", return_value=FakeDatabasesApi()):
+        client.create_managed_database(
+            "demo",
+            tables=["files", "other"],
+            keys={"files": ["id"]},
+            partition_by={"files": parts},
+            sorted_by={"files": sorts},
+        )
+
+    decls = captured["request"].to_dict()["schemas"][0]["tables"]
+    by_name = {d["name"]: d for d in decls}
+    assert by_name["files"]["partition_by"] == [
+        {"column": "event_date", "transform": "identity"}
+    ]
+    assert by_name["files"]["sorted_by"] == [
+        {"column": "event_time", "direction": "desc", "nulls": "last"}
+    ]
+    # A table absent from the mapping gets no layout, not an empty one.
+    assert by_name["other"].get("partition_by") is None
+    assert by_name["other"].get("sorted_by") is None
+
+
+def test_managed_table_layout_reads_it_back():
+    parts, sorts = _layout()
+    client = _client()
+    info = SimpleNamespace(
+        table="files", var_schema="public", partition_by=parts, sorted_by=sorts
+    )
+    captured = {}
+
+    class FakeInfoSchema:
+        def information_schema(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(tables=[info])
+
+    with patch.object(client, "_information_schema", return_value=FakeInfoSchema()), patch.object(
+        client, "_as_managed_database", return_value=_MANAGED_DB
+    ):
+        layout = client.managed_table_layout("db_1", "files")
+
+    assert layout.table_name == "files"
+    assert [p.column for p in layout.partition_by] == ["event_date"]
+    assert [s.column for s in layout.sorted_by] == ["event_time"]
+    assert layout.is_partitioned is True
+    assert layout.is_sorted is True
+    # Filtered server-side, not by paging the whole listing.
+    assert captured["var_schema"] == "public"
+    assert captured["table"] == "files"
+    assert captured["connection_id"] == _MANAGED_DB.default_connection_id
+
+
+def test_managed_table_layout_distinguishes_absent_from_unpartitioned():
+    """KeyError for a table the server does not report, empty lists for one
+    declared without a layout. Collapsing the two would let a caller read "table
+    isn't there" as "confirmed no layout" and load into something unverified.
+
+    Each call gets a FRESH response via side_effect. Sharing one would leave the
+    second assertion inspecting a consumed result rather than the case named
+    here.
+    """
+    client = _client()
+    plain = SimpleNamespace(table="files", var_schema="public", partition_by=[], sorted_by=[])
+
+    def respond(**kwargs):
+        found = [plain] if kwargs.get("table") == "files" else []
+        return SimpleNamespace(tables=found)
+
+    api = SimpleNamespace(information_schema=respond)
+    with patch.object(client, "_information_schema", return_value=api), patch.object(
+        client, "_as_managed_database", return_value=_MANAGED_DB
+    ):
+        layout = client.managed_table_layout("db_1", "files")
+        assert layout.is_partitioned is False and layout.is_sorted is False
+
+        with pytest.raises(KeyError, match="missing"):
+            client.managed_table_layout("db_1", "missing")
+
+
+def test_create_managed_database_refuses_layout_for_a_table_it_is_not_creating():
+    """A typo'd table name in the layout mapping would otherwise be dropped, and
+    the table it was meant for created flat — permanently, since a layout cannot
+    be added later."""
+    parts, _ = _layout()
+    client = _client()
+
+    with patch.object(client, "_databases_api") as dbs, pytest.raises(ValueError, match="fils"):
+        client.create_managed_database(
+            "demo", tables=["files"], partition_by={"fils": parts}
+        )
+    dbs.return_value.create_database.assert_not_called()

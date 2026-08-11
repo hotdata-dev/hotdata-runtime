@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from hotdata.exceptions import ApiException
+from hotdata.models.table_partition_key import TablePartitionKey
+from hotdata.models.table_sort_key import TableSortKey
 
 DEFAULT_SCHEMA = "public"
 
@@ -31,6 +33,47 @@ class ManagedTable:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class TableLayout:
+    """A managed table's declared storage layout, as the server reports it.
+
+    Both lists carry the generated `TablePartitionKey` / `TableSortKey` models,
+    in the order they were declared. A layout is fixed when the table is created
+    and cannot be altered, so reading it back is the only way to confirm what was
+    actually applied — which is why this exists as a first-class return rather
+    than a field on `ManagedTable`, whose other fields describe sync state.
+
+    Empty lists mean no layout was declared. That reading is only safe because
+    this is resolved through a MANAGED database: the same fields on a table
+    discovered from an external connection are empty because its layout belongs
+    to the upstream system, which is "not known from here" rather than
+    "confirmed none".
+    """
+
+    schema_name: str
+    table_name: str
+    partition_by: list[TablePartitionKey]
+    sorted_by: list[TableSortKey]
+
+    # NO to_dict(), unlike every other dataclass here, and deliberately so.
+    # `asdict()` would copy the pydantic key models through untouched rather than
+    # flatten them, so it would not return a plain dict. Mapping each key through
+    # its own `to_dict()` does flatten, but returns `dict[str, Any]` and adds
+    # eight errors under this package's strict mypy settings; hand-building the
+    # dict from named fields avoids that but silently drops any field a later
+    # spec adds to the key models, which is the failure this whole feature exists
+    # to prevent. A caller wanting dicts can map `k.to_dict()` itself and own
+    # that choice.
+
+    @property
+    def is_partitioned(self) -> bool:
+        return bool(self.partition_by)
+
+    @property
+    def is_sorted(self) -> bool:
+        return bool(self.sorted_by)
 
 
 @dataclass(frozen=True)

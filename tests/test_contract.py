@@ -28,7 +28,6 @@ def test_public_exports_contract():
         "classify_sdk_error",
         "default_api_key",
         "default_host",
-        "default_session_id",
         "explicit_workspace_id",
         "from_env",
         "is_parquet_path",

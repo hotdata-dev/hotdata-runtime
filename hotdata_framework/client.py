@@ -49,7 +49,6 @@ from hotdata_framework.databases import (
 from hotdata_framework.env import (
     default_api_key,
     default_host,
-    default_session_id,
     normalize_host,
     pick_workspace,
 )
@@ -150,18 +149,15 @@ class HotdataClient:
         workspace_id: str,
         *,
         host: str | None = None,
-        session_id: str | None = None,
         request_timeout: float | tuple[float, float] | None = None,
     ) -> None:
         self._host = normalize_host(host) if host else default_host()
         self._api_key = api_key
         self._workspace_id = workspace_id
-        self._session_id = session_id
         self._config = Configuration(
             host=self._host,
             api_key=api_key,
             workspace_id=workspace_id,
-            session_id=session_id,
             retries=default_http_retries(),
         )
         self._api = ApiClient(self._config)
@@ -174,9 +170,8 @@ class HotdataClient:
         if not api_key:
             raise RuntimeError("HOTDATA_API_KEY must be set.")
         host = default_host()
-        session = default_session_id()
-        workspace_id = pick_workspace(api_key, host, session)
-        return cls(api_key, workspace_id, host=host, session_id=session)
+        workspace_id = pick_workspace(api_key, host)
+        return cls(api_key, workspace_id, host=host)
 
     @property
     def workspace_id(self) -> str:
@@ -185,10 +180,6 @@ class HotdataClient:
     @property
     def host(self) -> str:
         return self._host
-
-    @property
-    def session_id(self) -> str | None:
-        return self._session_id
 
     @property
     def api(self) -> ApiClient:

@@ -21,7 +21,6 @@ The supported import surface is:
 - `workspace_health_lines`
 - `default_api_key`
 - `default_host`
-- `default_session_id`
 - `explicit_workspace_id`
 - `list_workspaces`
 - `normalize_host`
@@ -43,7 +42,7 @@ Adapters should import from `hotdata_framework` and treat this surface as the st
 
 ### `HotdataClient`
 
-- Represents runtime context: API key, host, workspace, optional session.
+- Represents runtime context: API key, host, workspace.
 - `from_env()` resolves runtime context from env vars and selected workspace.
 - `execute_sql(sql)` returns `QueryResult` or raises `RuntimeError`/`TimeoutError`.
 - `get_result(result_id)` returns a ready `QueryResult` and waits for readiness when needed.
@@ -79,7 +78,6 @@ Adapters should import from `hotdata_framework` and treat this surface as the st
 
 - `default_api_key()` reads `HOTDATA_API_KEY`.
 - `default_host()` reads `HOTDATA_API_URL` (default: `https://api.hotdata.dev`) and normalizes it.
-- `default_session_id()` reads `HOTDATA_SANDBOX`.
 - `explicit_workspace_id()` reads `HOTDATA_WORKSPACE` (workspace public id).
 - `pick_workspace()` prefers explicit env workspace, then active workspace, then first workspace.
 - `resolve_workspace_selection()` is the canonical workspace selection algorithm. It returns `WorkspaceSelection` with selected workspace id, selection source, and discovered workspaces when auto-selected.

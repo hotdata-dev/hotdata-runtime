@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "hotdata-framework"
 version = "0.10.0"
-description = "Python framework for building Hotdata integrations: workspace/session runtime, query execution, and managed databases"
+description = "Python framework for building Hotdata integrations: workspace runtime, query execution, and managed databases"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

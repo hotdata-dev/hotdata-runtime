@@ -2,6 +2,9 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from hotdata.models.table_partition_key import TablePartitionKey
+from hotdata.models.table_sort_key import TableSortKey
+
 from hotdata_framework.client import (
     HotdataClient,
     ResultSummary,
@@ -14,6 +17,7 @@ from hotdata_framework.databases import (
     LoadManagedTableResult,
     ManagedDatabase,
     ManagedTable,
+    TableLayout,
     is_parquet_path,
 )
 from hotdata_framework.env import (
@@ -55,6 +59,9 @@ __all__ = [
     "QueryResult",
     "ResultSummary",
     "RunHistoryItem",
+    "TableLayout",
+    "TablePartitionKey",
+    "TableSortKey",
     "WorkspaceSelection",
     "__version__",
     "classify_sdk_error",

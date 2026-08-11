@@ -31,6 +31,9 @@ The supported import surface is:
 - `WorkspaceSelection`
 - `ManagedDatabase`
 - `ManagedTable`
+- `TableLayout`
+- `TablePartitionKey`
+- `TableSortKey`
 - `LoadManagedTableResult`
 - `CreateIndexResult`
 - `DEFAULT_SCHEMA`
@@ -56,6 +59,8 @@ Adapters should import from `hotdata_framework` and treat this surface as the st
   adapters should pass `connection_id` when known.
 - `uploads()` returns the uploads API wrapper for parquet staging.
 - `list_managed_databases()` returns all databases via the `/databases` API.
+- `add_managed_table(...)` and `create_managed_database(...)` accept `partition_by` / `sorted_by` to declare a table's storage layout. The layout is fixed when the table is created and cannot be altered afterwards, so omitting it is permanent for that table.
+- `managed_table_layout(database, table, schema=...)` returns the declared layout as `TableLayout`. Empty lists mean no layout was declared — sound only because the table is resolved through a managed database. Raises `KeyError` when the table is not declared, keeping "absent" distinct from "declared without a layout".
 - `resolve_managed_database(name_or_id)` resolves a database by id (direct lookup) or description (list scan). A `403` from `/databases` surfaces as `RuntimeError` (forbidden, not absent), preserving the underlying `ApiException` as `__cause__`.
 - `create_managed_database(description=..., schema=..., tables=..., expires_at=...)` creates a database via the `/databases` API and optionally declares tables up front. Returns a `ManagedDatabase` (id + `default_connection_id`) sufficient to load without a further read.
 - `delete_managed_database(name_or_id)` deletes a database via the `/databases` API.

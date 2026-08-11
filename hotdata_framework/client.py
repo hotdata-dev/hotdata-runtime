@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import functools
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any, Literal, get_args
 
@@ -15,9 +15,6 @@ from hotdata.api.jobs_api import JobsApi
 from hotdata.api.query_api import QueryApi
 from hotdata.api.query_runs_api import QueryRunsApi
 from hotdata.api.results_api import ResultsApi
-# The enriched wrapper (hotdata.uploads), NOT the generated hotdata.api class:
-# it adds the full upload_file orchestration used by upload_parquet.
-from hotdata.uploads import UploadError, UploadsApi
 from hotdata.exceptions import ApiException
 from hotdata.models.add_managed_table_request import AddManagedTableRequest
 from hotdata.models.async_query_response import AsyncQueryResponse
@@ -32,6 +29,12 @@ from hotdata.models.query_request import QueryRequest
 from hotdata.models.query_response import QueryResponse
 from hotdata.models.submit_job_response import SubmitJobResponse
 from hotdata.models.table_info import TableInfo
+from hotdata.models.table_partition_key import TablePartitionKey
+from hotdata.models.table_sort_key import TableSortKey
+
+# The enriched wrapper (hotdata.uploads), NOT the generated hotdata.api class:
+# it adds the full upload_file orchestration used by upload_parquet.
+from hotdata.uploads import UploadError, UploadsApi
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
 from urllib3.exceptions import ProtocolError
 
@@ -41,6 +44,7 @@ from hotdata_framework.databases import (
     LoadManagedTableResult,
     ManagedDatabase,
     ManagedTable,
+    TableLayout,
     api_error_message,
     enum_value,
     is_parquet_path,
@@ -286,18 +290,34 @@ class HotdataClient:
         schema: str = DEFAULT_SCHEMA,
         tables: list[str] | None = None,
         keys: dict[str, list[str]] | None = None,
+        partition_by: dict[str, Sequence[TablePartitionKey]] | None = None,
+        sorted_by: dict[str, Sequence[TableSortKey]] | None = None,
         expires_at: str | None = None,
     ) -> ManagedDatabase:
         """Create a managed database. ``keys`` maps a table to its key columns
-        (enabling delete/update/upsert on it); omitted tables are keyless."""
+        (enabling delete/update/upsert on it); omitted tables are keyless.
+
+        ``partition_by`` and ``sorted_by`` are keyed the same way — table name to
+        that table's keys, in declaration order — so a database can be created
+        with its tables already laid out. Tables absent from the mapping get no
+        layout, and a layout cannot be added afterwards: it is fixed at table
+        creation, so a table created here without one stays that way.
+        """
         keys = keys or {}
+        partition_by = partition_by or {}
+        sorted_by = sorted_by or {}
         schemas = None
         if tables:
             schemas = [
                 DatabaseDefaultSchemaDecl(
                     name=schema,
                     tables=[
-                        DatabaseDefaultTableDecl(name=t, key=list(keys.get(t, [])))
+                        DatabaseDefaultTableDecl(
+                            name=t,
+                            key=list(keys.get(t, [])),
+                            partition_by=list(partition_by.get(t, ())) or None,
+                            sorted_by=list(sorted_by.get(t, ())) or None,
+                        )
                         for t in tables
                     ],
                 )
@@ -417,6 +437,8 @@ class HotdataClient:
         *,
         schema: str = DEFAULT_SCHEMA,
         key: list[str] | None = None,
+        partition_by: Sequence[TablePartitionKey] | None = None,
+        sorted_by: Sequence[TableSortKey] | None = None,
     ) -> ManagedTable:
         """Declare a new table on an existing managed database.
 
@@ -424,9 +446,24 @@ class HotdataClient:
         :meth:`load_managed_table`. Use this to evolve a managed database's
         schema after creation without recreating it. ``key`` sets the
         row-identity columns for delete/update/upsert; omit for keyless.
+
+        ``partition_by`` and ``sorted_by`` declare the table's storage layout, in
+        the order given. THIS IS THE ONLY CHANCE TO SET IT: a layout is fixed
+        when the table is created and there is no alter path, so a table declared
+        without one keeps that shape until it is recreated and its data rewritten.
+        Confirm what was applied with :meth:`managed_table_layout`.
+
+        The generated key models are passed through rather than wrapped, so the
+        transform vocabulary and field names stay exactly the API's. Both are
+        re-exported from ``hotdata_framework`` so callers need one import.
         """
         db = self._as_managed_database(database)
-        request = AddManagedTableRequest(name=table, key=list(key or []))
+        request = AddManagedTableRequest(
+            name=table,
+            key=list(key or []),
+            partition_by=list(partition_by) if partition_by else None,
+            sorted_by=list(sorted_by) if sorted_by else None,
+        )
         try:
             self._databases_api().add_database_table(db.id, schema, request)
         except ApiException as e:
@@ -438,6 +475,42 @@ class HotdataClient:
             synced=False,
             last_sync=None,
         )
+
+    def managed_table_layout(
+        self,
+        database: str | ManagedDatabase,
+        table: str,
+        *,
+        schema: str = DEFAULT_SCHEMA,
+    ) -> TableLayout:
+        """Read back a managed table's declared storage layout.
+
+        The counterpart to the ``partition_by`` / ``sorted_by`` arguments on
+        :meth:`add_managed_table` and :meth:`create_managed_database`. Declaring a
+        layout is only half of it: it is fixed at table creation with no alter
+        path, so a caller that cares whether the layout took has to look, and a
+        caller that cannot confirm it should refuse to load rather than fill a
+        table it can never repair.
+
+        Empty lists here mean no layout was declared. That reading is sound
+        because the table is resolved through a managed database — the same fields
+        on a table discovered from an external connection are empty because its
+        layout belongs to the upstream system, which is not the same claim.
+
+        Raises KeyError when the table is not present on the database, so that
+        "no such table" is distinguishable from "declared without a layout"; the
+        two are very different for a caller deciding whether to load.
+        """
+        db = self._as_managed_database(database)
+        for info in self.iter_tables(connection_id=db.default_connection_id):
+            if info.table == table and info.var_schema == schema:
+                return TableLayout(
+                    schema_name=schema,
+                    table_name=table,
+                    partition_by=list(info.partition_by or []),
+                    sorted_by=list(info.sorted_by or []),
+                )
+        raise KeyError(f"{schema}.{table} is not declared on database {db.id}")
 
     def delete_managed_table(
         self,

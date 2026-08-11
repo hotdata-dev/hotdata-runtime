@@ -57,6 +57,20 @@ class TableLayout:
     partition_by: list[TablePartitionKey]
     sorted_by: list[TableSortKey]
 
+    def to_dict(self) -> dict[str, Any]:
+        """Plain dict, like the other dataclasses here.
+
+        Not `asdict()`: the key lists hold pydantic models, which `asdict` copies
+        through untouched, so the result would not be a plain dict. Each key is
+        mapped through its own `to_dict()` instead.
+        """
+        return {
+            "schema_name": self.schema_name,
+            "table_name": self.table_name,
+            "partition_by": [k.to_dict() for k in self.partition_by],
+            "sorted_by": [k.to_dict() for k in self.sorted_by],
+        }
+
     @property
     def is_partitioned(self) -> bool:
         return bool(self.partition_by)

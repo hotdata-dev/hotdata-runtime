@@ -489,15 +489,19 @@ def test_create_managed_database_sends_per_table_layout():
 
 
 def test_managed_table_layout_reads_it_back():
-
     parts, sorts = _layout()
     client = _client()
     info = SimpleNamespace(
         table="files", var_schema="public", partition_by=parts, sorted_by=sorts
     )
-    other = SimpleNamespace(table="elsewhere", var_schema="public", partition_by=[], sorted_by=[])
+    captured = {}
 
-    with patch.object(client, "iter_tables", return_value=iter([other, info])), patch.object(
+    class FakeInfoSchema:
+        def information_schema(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(tables=[info])
+
+    with patch.object(client, "_information_schema", return_value=FakeInfoSchema()), patch.object(
         client, "_as_managed_database", return_value=_MANAGED_DB
     ):
         layout = client.managed_table_layout("db_1", "files")
@@ -507,17 +511,34 @@ def test_managed_table_layout_reads_it_back():
     assert [s.column for s in layout.sorted_by] == ["event_time"]
     assert layout.is_partitioned is True
     assert layout.is_sorted is True
+    # Filtered server-side, not by paging the whole listing.
+    assert captured["var_schema"] == "public"
+    assert captured["table"] == "files"
+    assert captured["connection_id"] == _MANAGED_DB.default_connection_id
+    # to_dict flattens the pydantic keys rather than copying them through.
+    assert layout.to_dict()["partition_by"] == [
+        {"column": "event_date", "transform": "identity"}
+    ]
 
 
 def test_managed_table_layout_distinguishes_absent_from_unpartitioned():
-    """KeyError for a missing table, empty lists for one declared without a
-    layout. Collapsing the two would let a caller treat "table isn't there" as
-    "confirmed no layout" and load into something it never verified."""
+    """KeyError for a table the server does not report, empty lists for one
+    declared without a layout. Collapsing the two would let a caller read "table
+    isn't there" as "confirmed no layout" and load into something unverified.
 
+    Each call gets a FRESH response via side_effect. Sharing one would leave the
+    second assertion inspecting a consumed result rather than the case named
+    here.
+    """
     client = _client()
     plain = SimpleNamespace(table="files", var_schema="public", partition_by=[], sorted_by=[])
 
-    with patch.object(client, "iter_tables", return_value=iter([plain])), patch.object(
+    def respond(**kwargs):
+        found = [plain] if kwargs.get("table") == "files" else []
+        return SimpleNamespace(tables=found)
+
+    api = SimpleNamespace(information_schema=respond)
+    with patch.object(client, "_information_schema", return_value=api), patch.object(
         client, "_as_managed_database", return_value=_MANAGED_DB
     ):
         layout = client.managed_table_layout("db_1", "files")
@@ -525,3 +546,18 @@ def test_managed_table_layout_distinguishes_absent_from_unpartitioned():
 
         with pytest.raises(KeyError, match="missing"):
             client.managed_table_layout("db_1", "missing")
+
+
+def test_create_managed_database_refuses_layout_for_a_table_it_is_not_creating():
+    """A typo'd table name in the layout mapping would otherwise be dropped, and
+    the table it was meant for created flat — permanently, since a layout cannot
+    be added later."""
+    parts, _ = _layout()
+    client = _client()
+
+    with patch.object(client, "_databases_api") as dbs:
+        with pytest.raises(ValueError, match="fils"):
+            client.create_managed_database(
+                "demo", tables=["files"], partition_by={"fils": parts}
+            )
+    dbs.return_value.create_database.assert_not_called()

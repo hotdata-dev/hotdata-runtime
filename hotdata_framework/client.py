@@ -306,6 +306,16 @@ class HotdataClient:
         keys = keys or {}
         partition_by = partition_by or {}
         sorted_by = sorted_by or {}
+        # A layout aimed at a table that is not being created would otherwise be
+        # dropped in silence, and the table it was meant for created flat — which
+        # is permanent, since a layout is fixed at creation with no alter path. A
+        # typo'd `keys` entry costs nothing by comparison: load_managed_table
+        # takes `key=` per call, so it can be corrected later.
+        unknown = (set(partition_by) | set(sorted_by)) - set(tables or ())
+        if unknown:
+            raise ValueError(
+                f"layout given for tables not being created: {', '.join(sorted(unknown))}"
+            )
         schemas = None
         if tables:
             schemas = [
@@ -502,14 +512,23 @@ class HotdataClient:
         two are very different for a caller deciding whether to load.
         """
         db = self._as_managed_database(database)
-        for info in self.iter_tables(connection_id=db.default_connection_id):
-            if info.table == table and info.var_schema == schema:
-                return TableLayout(
-                    schema_name=schema,
-                    table_name=table,
-                    partition_by=list(info.partition_by or []),
-                    sorted_by=list(info.sorted_by or []),
-                )
+        # Filtered server-side rather than paging iter_tables: this answers a
+        # single-table question, and a table sorting late in the listing would
+        # otherwise cost several round trips. include_columns is left off — the
+        # layout lives on the table row, not the columns.
+        resp = self._information_schema().information_schema(
+            connection_id=db.default_connection_id,
+            var_schema=schema,
+            table=table,
+            limit=1,
+        )
+        for info in resp.tables:
+            return TableLayout(
+                schema_name=schema,
+                table_name=table,
+                partition_by=list(info.partition_by or []),
+                sorted_by=list(info.sorted_by or []),
+            )
         raise KeyError(f"{schema}.{table} is not declared on database {db.id}")
 
     def delete_managed_table(

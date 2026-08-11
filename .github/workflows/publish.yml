@@ -31,6 +31,21 @@ jobs:
       # The tag being released, whether it arrived by push or by dispatch.
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
+      # Before checkout, because checkout resolves the input as an arbitrary ref:
+      # a branch or SHA is fetched first and only rejected later by the version
+      # match below, which is also looser (`^v[0-9]`). Strict here so the dispatch
+      # contract matches release.yml — release.sh only ever produces X.Y.Z.
+      - name: Validate release tag format
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag must look like vX.Y.Z, got: $INPUT_TAG" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.tag || github.ref_name }}

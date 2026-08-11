@@ -48,9 +48,16 @@ def test_pre_response_connection_reset_still_retries_any_method() -> None:
     any response means the request never landed, so a POST retry is safe."""
     from urllib3.exceptions import ProtocolError
 
+    # `_is_connection_error` is urllib3-private, and urllib3 reaches this package
+    # only as an unpinned transitive dependency — so an upstream rename breaks
+    # this test for reasons unrelated to this repo. Accepted knowingly: it is the
+    # only hook that separates a reset from any other ProtocolError without
+    # standing up a live socket.
     retry = _retry_policy()
     cause = ConnectionResetError(54, "Connection reset by peer")
     reset = ProtocolError("Connection aborted.", cause)
     assert retry._is_connection_error(reset)
-    # A read timeout is NOT reclassified — the server may have done the work.
+    # A ProtocolError with no connection-level cause is NOT reclassified: only a
+    # reset proves the request never landed. Read timeouts never reach this branch
+    # at all — urllib3 raises those as ReadTimeoutError, and they stay method-gated.
     assert not retry._is_connection_error(ProtocolError("Connection aborted.", None))

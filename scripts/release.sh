@@ -11,10 +11,10 @@ need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
 #
 # `python3` carries no version guarantee, and this package's own requires-python
 # is >=3.10 — so hardcoding it meant the release script could not run on the
-# oldest Python the package claims to support. CI never sees this, because it
-# installs 3.12 through uv; only a human cutting a release does, which is why it
-# went unnoticed. The symptom was a bare ModuleNotFoundError, which reads as a
-# broken checkout rather than a too-old interpreter.
+# oldest Python the package claims to support. No workflow runs this script; only
+# a human cutting a release does, which is why it went unnoticed for so long. The
+# symptom was a bare ModuleNotFoundError, which reads as a broken checkout rather
+# than a too-old interpreter.
 #
 # `uv` is the fallback because this repo already builds and tests through it, so
 # a machine that can run the suite can run the release.

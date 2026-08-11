@@ -21,10 +21,16 @@ resolve_python() {
   elif command -v uv >/dev/null 2>&1; then
     echo "uv run --no-project --python 3.12 python"
   else
-    die "need python3 >= 3.11 (for tomllib) or uv; python3 is $(python3 -V 2>&1 || echo absent)"
+    die "need python3 >= 3.11 (for tomllib) or uv; python3 is $(command -v python3 >/dev/null 2>&1 && python3 -V 2>&1 || echo absent)"
   fi
 }
-PY_BIN="$(resolve_python)"
+
+# Deferred, not resolved at load: the commands that never touch Python must keep
+# working without a usable interpreter — otherwise the message telling you which
+# interpreter you need is itself gated on having it, and `--help` breaks on
+# exactly the machine this resolution exists for. Empty default satisfies `set -u`
+# if a helper is ever reached by another path.
+PY_BIN=""
 
 usage() {
   cat <<'EOF'
@@ -118,6 +124,7 @@ update_changelog() {
 }
 
 cmd_prepare() {
+  PY_BIN="$(resolve_python)"
   local bump="${1:-}"
   [[ -n "$bump" ]] || { usage; die "missing bump kind or explicit version"; }
   need gh
@@ -168,6 +175,7 @@ After merge, run \`./scripts/release.sh publish\` from a clean \`${base}\` check
 }
 
 cmd_publish() {
+  PY_BIN="$(resolve_python)"
   need gh
   ensure_clean
 

@@ -7,28 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- A `POST` is no longer replayed because of a response status. `HotdataClient`
-  passed its own `retries=` into `Configuration`, which replaced the generated
-  SDK's policy wholesale with one listing `POST` in `allowed_methods` alongside
-  a `(502, 503, 504)` forcelist — so an intermediary timing out a long request
-  produced a silent, identical re-`POST` while the server was still working on
-  the first one. For a load that is not idempotent: the duplicate collides with
-  the write lock the original holds and is refused.
-
-  The override is removed and the SDK's own default now applies. It is the
-  policy this wrapper was reaching for — `hotdata._retry` retries a
-  *pre-response* connection reset (the stale pooled socket case, where the
-  server did no work) on any method, while leaving read timeouts and status
-  retries idempotent-only.
-
-### Removed
-
-- `hotdata_framework.http` and `default_http_retries()`. The module existed only
-  to build the retry policy above and had no other callers. It predates
-  `hotdata._retry`, which supersedes it.
-
 
 ## [0.11.0] - 2026-08-11
 
@@ -65,6 +43,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the workspace helpers. Adapters that re-export session context in their own
   signatures — a `session_id=` parameter, a `session_id` metadata key — need to
   remove it from theirs too, which makes their own release breaking in turn.
+
+
+- `hotdata_framework.http` and `default_http_retries()`. The module existed only
+  to build the retry policy above and had no other callers. It predates
+  `hotdata._retry`, which supersedes it.
+
+### Fixed
+
+- A `POST` is no longer replayed because of a response status. `HotdataClient`
+  passed its own `retries=` into `Configuration`, which replaced the generated
+  SDK's policy wholesale with one listing `POST` in `allowed_methods` alongside
+  a `(502, 503, 504)` forcelist — so an intermediary timing out a long request
+  produced a silent, identical re-`POST` while the server was still working on
+  the first one. For a load that is not idempotent: the duplicate collides with
+  the write lock the original holds and is refused.
+
+  The override is removed and the SDK's own default now applies. It is the
+  policy this wrapper was reaching for — `hotdata._retry` retries a
+  *pre-response* connection reset (the stale pooled socket case, where the
+  server did no work) on any method, while leaving read timeouts and status
+  retries idempotent-only.
 
 ## [0.10.0] - 2026-08-07
 

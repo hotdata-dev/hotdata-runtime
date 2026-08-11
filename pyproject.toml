@@ -26,7 +26,10 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  # 0.7.0 adds `key` to table decls (create_managed_database(keys=) / add_managed_table(key=))
+  # Floor: 0.8.0 carries the per-load `key` on load_managed_table — the merge key
+  # for delete/update/upsert loads, matched per load rather than declared at table
+  # creation. 0.7.0 is what first put `key` on the table decls themselves
+  # (create_managed_database(keys=) / add_managed_table(key=)).
   #
   # Capped to the current minor. This package is a hand-written wrapper over a
   # GENERATED client, so an SDK minor can remove a model field or a Configuration

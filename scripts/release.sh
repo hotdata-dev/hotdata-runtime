@@ -7,11 +7,14 @@ cd "$ROOT"
 die() { echo "error: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
 
-# An interpreter that can `import tomllib` — stdlib only from 3.11, while
-# `python3` on macOS is still 3.9. Hardcoding `python3` made every step below
-# fail with a bare ModuleNotFoundError, which reads as a broken checkout rather
-# than a too-old interpreter, and it failed at the FIRST step so nothing was
-# half-done. Resolved once here rather than per call site.
+# An interpreter that can `import tomllib`, which is stdlib only from 3.11.
+#
+# `python3` carries no version guarantee, and this package's own requires-python
+# is >=3.10 — so hardcoding it meant the release script could not run on the
+# oldest Python the package claims to support. CI never sees this, because it
+# installs 3.12 through uv; only a human cutting a release does, which is why it
+# went unnoticed. The symptom was a bare ModuleNotFoundError, which reads as a
+# broken checkout rather than a too-old interpreter.
 #
 # `uv` is the fallback because this repo already builds and tests through it, so
 # a machine that can run the suite can run the release.

@@ -27,7 +27,14 @@ classifiers = [
 ]
 dependencies = [
   # 0.7.0 adds `key` to table decls (create_managed_database(keys=) / add_managed_table(key=))
-  "hotdata>=0.8.0",
+  #
+  # Capped to the current minor. This package is a hand-written wrapper over a
+  # GENERATED client, so an SDK minor can remove a model field or a Configuration
+  # keyword we pass positionally and there is no regeneration step here to catch
+  # it — an uncapped floor turns someone else's release into a break in ours,
+  # with no commit of our own to point at. Raise the cap deliberately, after
+  # running the suite against the new minor.
+  "hotdata>=0.8.0,<0.9",
   "pandas>=2.0",
   "pyarrow>=14.0",
 ]

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Cap the `hotdata` dependency to the current minor (`>=0.8.0,<0.9`). This
+  package wraps a *generated* client, so an SDK minor can remove a model field
+  or a `Configuration` keyword this wrapper passes, and there is no regeneration
+  step here to surface it — an uncapped floor turns an SDK release into a break
+  in this package, in versions already published. Raise the cap deliberately
+  after running the suite against the new minor.
+
 
 ## [0.10.0] - 2026-08-07
 

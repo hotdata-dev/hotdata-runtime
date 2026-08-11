@@ -4,10 +4,9 @@ on:
   push:
     tags:
       - 'v[0-9]*'
-  # RELEASING.md already documents this recovery path — "If PyPI publish
-  # succeeded but the GitHub Release workflow failed, rerun it from main without
-  # retagging" — but the trigger it needs was never here, so the documented
-  # command has always failed. Adding it makes the doc true.
+  # Repair the Release for a tag that already exists, without moving it. See
+  # RELEASING.md, "If a release workflow fails" — added alongside this trigger,
+  # since a capability nobody can find is not much better than not having it.
   workflow_dispatch:
     inputs:
       tag:
@@ -66,4 +65,9 @@ jobs:
           name: ${{ steps.meta.outputs.name }} ${{ steps.meta.outputs.version }}
           body: ${{ steps.notes.outputs.body }}
           generate_release_notes: false
-          make_latest: true
+          # Push-only. On the push trigger the tag IS the newest version, so
+          # marking it latest is always right. A dispatch repairs the Release for
+          # a tag that already exists, and by then a newer version may have
+          # shipped — re-running for v1.0.0 after v1.1.0 would silently demote it
+          # and point /releases/latest at the older one.
+          make_latest: ${{ github.event_name == 'push' }}

@@ -4,9 +4,20 @@ on:
   push:
     tags:
       - 'v[0-9]*'
+  # Retry an existing tag without moving it. A publish can fail for reasons that
+  # have nothing to do with the code — a stale action pin, a PyPI outage — and
+  # with only the tag trigger the choices were to delete and re-push the tag or
+  # to burn a version number on a CI fix. Neither is a good answer to
+  # "the upload failed, run it again".
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish (e.g. v1.2.3)
+        required: true
+        type: string
 
 concurrency:
-  group: pypi-publish-${{ github.ref_name }}
+  group: pypi-publish-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -16,8 +27,13 @@ jobs:
   build:
     name: Build distribution
     runs-on: ubuntu-latest
+    env:
+      # The tag being released, whether it arrived by push or by dispatch.
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
@@ -28,11 +44,11 @@ jobs:
 
       - name: Verify tag matches pyproject version
         run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9] ]]; then
-            echo "Release tag '$GITHUB_REF_NAME' must start with 'v' followed by a digit (e.g. v1.0.0)" >&2
+          if [[ ! "$TAG" =~ ^v[0-9] ]]; then
+            echo "Release tag '$TAG' must start with 'v' followed by a digit (e.g. v1.0.0)" >&2
             exit 1
           fi
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${TAG#v}"
           pkg_version=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
           if [ "$tag" != "$pkg_version" ]; then
             echo "Release tag ($tag) does not match pyproject.toml version ($pkg_version)" >&2
@@ -65,5 +81,10 @@ jobs:
           name: dist
           path: dist/
 
+      # v1.13.0's bundled twine rejects `Metadata-Version: 2.5`, which current
+      # hatchling emits: `InvalidDistribution: '2.5' is not a valid metadata
+      # version`. The build job's own `twine check --strict` passes, because it
+      # pip-installs a current twine — so the failure appears only at upload,
+      # after the tag is already public.
       - name: Publish via Trusted Publishing
-        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

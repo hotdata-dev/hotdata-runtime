@@ -65,9 +65,10 @@ jobs:
           name: ${{ steps.meta.outputs.name }} ${{ steps.meta.outputs.version }}
           body: ${{ steps.notes.outputs.body }}
           generate_release_notes: false
-          # Push-only. On the push trigger the tag IS the newest version, so
-          # marking it latest is always right. A dispatch repairs the Release for
-          # a tag that already exists, and by then a newer version may have
-          # shipped — re-running for v1.0.0 after v1.1.0 would silently demote it
-          # and point /releases/latest at the older one.
-          make_latest: ${{ github.event_name == 'push' }}
+          # Let GitHub decide by tag date/semver rather than by run order. On a
+          # push the tag is the newest version and becomes latest; on a dispatch
+          # repairing an older tag, a newer release keeps the badge. Note `false`
+          # is not "leave alone" — it explicitly marks a release NOT latest, so
+          # gating on the event would demote the newest tag in the very case this
+          # trigger exists for: repairing its Release after a failed push run.
+          make_latest: legacy

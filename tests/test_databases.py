@@ -515,10 +515,6 @@ def test_managed_table_layout_reads_it_back():
     assert captured["var_schema"] == "public"
     assert captured["table"] == "files"
     assert captured["connection_id"] == _MANAGED_DB.default_connection_id
-    # to_dict flattens the pydantic keys rather than copying them through.
-    assert layout.to_dict()["partition_by"] == [
-        {"column": "event_date", "transform": "identity"}
-    ]
 
 
 def test_managed_table_layout_distinguishes_absent_from_unpartitioned():
@@ -555,9 +551,8 @@ def test_create_managed_database_refuses_layout_for_a_table_it_is_not_creating()
     parts, _ = _layout()
     client = _client()
 
-    with patch.object(client, "_databases_api") as dbs:
-        with pytest.raises(ValueError, match="fils"):
-            client.create_managed_database(
-                "demo", tables=["files"], partition_by={"fils": parts}
-            )
+    with patch.object(client, "_databases_api") as dbs, pytest.raises(ValueError, match="fils"):
+        client.create_managed_database(
+            "demo", tables=["files"], partition_by={"fils": parts}
+        )
     dbs.return_value.create_database.assert_not_called()

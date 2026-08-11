@@ -16,6 +16,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in this package, in versions already published. Raise the cap deliberately
   after running the suite against the new minor.
 
+### Removed
+
+- **Breaking:** session/sandbox support is gone. `HotdataClient` no longer accepts
+  `session_id=`, `HotdataClient.session_id` is removed, `default_session_id()` and
+  the `HOTDATA_SANDBOX` read are gone, and `list_workspaces()`,
+  `resolve_workspace_selection()` and `pick_workspace()` lose their `session_id`
+  parameter — note that loss is **positional**, so a three-argument call raises an
+  arity `TypeError` rather than an unexpected-keyword one.
+  `workspace_health_lines()` no longer emits a `sandbox` line.
+
+  **Why now.** The server stopped enforcing session scoping some time ago, so the
+  value already reached nothing. What makes removal urgent rather than tidy is
+  that the SDK is dropping the `SessionId` security scheme: against that release
+  `Configuration(session_id=...)` raises `TypeError` instead of setting a header,
+  and this package passed it unconditionally — so every `HotdataClient(...)`
+  would fail at construction. This package still pins `hotdata<0.9`, so nothing
+  is broken today; the change is what lets the cap be raised later without a
+  second breaking release.
+
+  **Migrating.** Drop `session_id=` from `HotdataClient(...)`, stop reading
+  `client.session_id`, stop setting `HOTDATA_SANDBOX`, and pass two arguments to
+  the workspace helpers. Adapters that re-export session context in their own
+  signatures — a `session_id=` parameter, a `session_id` metadata key — need to
+  remove it from theirs too, which makes their own release breaking in turn.
+
 
 ## [0.10.0] - 2026-08-07
 

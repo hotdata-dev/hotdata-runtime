@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from hotdata import Configuration
 from hotdata.exceptions import ForbiddenException
 
 from hotdata_framework.client import HotdataClient
@@ -153,7 +154,7 @@ def test_normalize_host(raw: str, expected: str):
 
 def test_pick_workspace_prefers_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("HOTDATA_WORKSPACE", "ws_explicit")
-    assert pick_workspace("k", "https://api.hotdata.dev", None) == "ws_explicit"
+    assert pick_workspace("k", "https://api.hotdata.dev") == "ws_explicit"
 
 
 def test_resolve_workspace_selection_prefers_env_without_listing(
@@ -161,7 +162,7 @@ def test_resolve_workspace_selection_prefers_env_without_listing(
 ):
     monkeypatch.setenv("HOTDATA_WORKSPACE", "ws_explicit")
     with patch("hotdata_framework.env.list_workspaces") as listing:
-        resolved = resolve_workspace_selection("k", "https://api.hotdata.dev", None)
+        resolved = resolve_workspace_selection("k", "https://api.hotdata.dev")
     listing.assert_not_called()
     assert resolved.workspace_id == "ws_explicit"
     assert resolved.source == "explicit_env"
@@ -180,7 +181,7 @@ def test_pick_workspace_chooses_first_active(monkeypatch: pytest.MonkeyPatch):
 
     with patch("hotdata_framework.env.WorkspacesApi") as Api:
         Api.return_value.list_workspaces.return_value = listing
-        assert pick_workspace("k", "https://api.hotdata.dev", None) == "ws_2"
+        assert pick_workspace("k", "https://api.hotdata.dev") == "ws_2"
 
 
 def test_pick_workspace_falls_back_to_first(monkeypatch: pytest.MonkeyPatch):
@@ -194,7 +195,7 @@ def test_pick_workspace_falls_back_to_first(monkeypatch: pytest.MonkeyPatch):
 
     with patch("hotdata_framework.env.WorkspacesApi") as Api:
         Api.return_value.list_workspaces.return_value = listing
-        assert pick_workspace("k", "https://api.hotdata.dev", None) == "ws_1"
+        assert pick_workspace("k", "https://api.hotdata.dev") == "ws_1"
 
 
 def test_resolve_workspace_selection_source_first(monkeypatch: pytest.MonkeyPatch):
@@ -206,7 +207,7 @@ def test_resolve_workspace_selection_source_first(monkeypatch: pytest.MonkeyPatc
     listing = SimpleNamespace(workspaces=items)
     with patch("hotdata_framework.env.WorkspacesApi") as Api:
         Api.return_value.list_workspaces.return_value = listing
-        resolved = resolve_workspace_selection("k", "https://api.hotdata.dev", None)
+        resolved = resolve_workspace_selection("k", "https://api.hotdata.dev")
     assert resolved.workspace_id == "ws_1"
     assert resolved.source == "first"
     assert resolved.workspaces == items
@@ -225,7 +226,7 @@ def test_resolve_workspace_selection_returns_workspaces_and_source(
 
     with patch("hotdata_framework.env.WorkspacesApi") as Api:
         Api.return_value.list_workspaces.return_value = listing
-        resolved = resolve_workspace_selection("k", "https://api.hotdata.dev", None)
+        resolved = resolve_workspace_selection("k", "https://api.hotdata.dev")
     assert resolved.workspace_id == "ws_2"
     assert resolved.source == "active"
     assert resolved.workspaces == items
@@ -447,3 +448,99 @@ def test_list_run_history_returns_normalized_items():
     assert out[0].execution_time_ms == 7
     assert out[0].to_dict()["result_id"] == "res_1"
     assert fake_runs.kwargs == {"limit": 5}
+
+
+# ---------------------------------------------------------------------------
+# Session removal — asserted at the wire, not at the signature
+#
+# A signature-shaped check ("does __init__ accept session_id?") is satisfied by
+# any unrecognised keyword and says nothing about what goes on the request. The
+# feature was proven revivable from the ENVIRONMENT with the whole suite green:
+# read HOTDATA_SANDBOX, pass it to Configuration, and the X-Session-Id header is
+# back on every call with no signature change to notice. So these assert on
+# `Configuration.api_keys`, which is where the generated client actually decides
+# to send the header, and they set HOTDATA_SANDBOX so an environment-sourced
+# revival has something to find.
+
+
+def _sandbox_set(monkeypatch: pytest.MonkeyPatch) -> str:
+    value = "sb_should_reach_nothing"
+    monkeypatch.setenv("HOTDATA_SANDBOX", value)
+    return value
+
+
+def test_client_registers_no_session_header(monkeypatch: pytest.MonkeyPatch):
+    """The removal's observable contract: no X-Session-Id on anything this client
+    sends. `api_keys` is the SDK's own record of which security schemes it will
+    attach, so an empty SessionId slot is the header being absent."""
+    _sandbox_set(monkeypatch)
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    assert "SessionId" not in client.api.configuration.api_keys
+    assert client.api.configuration.api_keys == {"WorkspaceId": "ws"}
+
+
+def test_client_rejects_session_id_by_name(monkeypatch: pytest.MonkeyPatch):
+    """`match=` matters: without it the assertion passes for ANY unknown keyword,
+    making it a typo detector rather than a statement about `session_id`."""
+    _sandbox_set(monkeypatch)
+    with pytest.raises(TypeError, match="session_id"):
+        HotdataClient("k", "ws", host="https://api.hotdata.dev", session_id="sb_x")
+    # The property is gone too — the CHANGELOG says so, and an adapter reading it
+    # should get AttributeError rather than a stale value.
+    assert not hasattr(HotdataClient("k", "ws", host="https://api.hotdata.dev"), "session_id")
+
+
+def test_workspace_listing_registers_no_session_header(monkeypatch: pytest.MonkeyPatch):
+    """`list_workspaces` builds its OWN Configuration, so it is a second place the
+    header can come back — and it is the pre-auth call, made before any workspace
+    is known."""
+    _clear_workspace_env(monkeypatch)
+    _sandbox_set(monkeypatch)
+    seen: list[Configuration] = []
+
+    def spy(*args: object, **kwargs: object) -> Configuration:
+        # Assert on the CONFIG, not on the kwargs. `session_id=` is only one way
+        # back: `Configuration(api_keys={"SessionId": ...})` is a documented
+        # escape hatch that re-attaches the header with no such keyword, and a
+        # kwargs-only check waves it through.
+        cfg = Configuration(*args, **kwargs)
+        seen.append(cfg)
+        return cfg
+
+    listing = SimpleNamespace(workspaces=[SimpleNamespace(public_id="ws_1", active=True)])
+    with patch("hotdata_framework.env.Configuration", spy), patch(
+        "hotdata_framework.env.WorkspacesApi"
+    ) as Api:
+        Api.return_value.list_workspaces.return_value = listing
+        assert pick_workspace("k", "https://api.hotdata.dev") == "ws_1"
+    assert seen, "list_workspaces built no Configuration — the spy never fired"
+    for cfg in seen:
+        assert "SessionId" not in cfg.api_keys
+
+
+def test_from_env_builds_a_client_without_a_session(monkeypatch: pytest.MonkeyPatch):
+    """`from_env` is the entry point every adapter uses, and its body had no
+    coverage at all: the module-level `from_env` test patches this classmethod
+    out. Leaving a stale 3-argument `pick_workspace(...)` call here broke it
+    unconditionally while the suite stayed green."""
+    _clear_workspace_env(monkeypatch)
+    _sandbox_set(monkeypatch)
+    monkeypatch.setenv("HOTDATA_API_KEY", "k_env")
+    monkeypatch.setenv("HOTDATA_API_URL", "https://api.hotdata.dev")
+
+    with patch("hotdata_framework.client.pick_workspace") as picked:
+        picked.return_value = "ws_from_env"
+        client = HotdataClient.from_env()
+
+    # Two arguments, positionally — the signature this change trimmed.
+    assert picked.call_args.args == ("k_env", "https://api.hotdata.dev")
+    assert picked.call_args.kwargs == {}
+    assert client.workspace_id == "ws_from_env"
+    assert client.host == "https://api.hotdata.dev"
+    assert "SessionId" not in client.api.configuration.api_keys
+
+
+def test_from_env_requires_an_api_key(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("HOTDATA_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="HOTDATA_API_KEY"):
+        HotdataClient.from_env()

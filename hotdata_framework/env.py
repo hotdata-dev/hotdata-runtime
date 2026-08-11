@@ -31,16 +31,11 @@ def default_host() -> str:
     return normalize_host(raw)
 
 
-def default_session_id() -> str | None:
-    return os.environ.get("HOTDATA_SANDBOX")
-
-
-def list_workspaces(api_key: str, host: str, session_id: str | None):
+def list_workspaces(api_key: str, host: str):
     cfg = Configuration(
         host=host,
         api_key=api_key,
         workspace_id=None,
-        session_id=session_id,
     )
     with ApiClient(cfg) as api:
         listing = WorkspacesApi(api).list_workspaces()
@@ -54,9 +49,7 @@ class WorkspaceSelection:
     workspaces: list
 
 
-def resolve_workspace_selection(
-    api_key: str, host: str, session_id: str | None
-) -> WorkspaceSelection:
+def resolve_workspace_selection(api_key: str, host: str) -> WorkspaceSelection:
     explicit = explicit_workspace_id()
     if explicit:
         return WorkspaceSelection(
@@ -64,7 +57,7 @@ def resolve_workspace_selection(
             source="explicit_env",
             workspaces=[],
         )
-    workspaces = list_workspaces(api_key, host, session_id)
+    workspaces = list_workspaces(api_key, host)
     if not workspaces:
         raise RuntimeError("No Hotdata workspaces found for this API key.")
     active = [w for w in workspaces if w.active]
@@ -76,6 +69,6 @@ def resolve_workspace_selection(
     )
 
 
-def pick_workspace(api_key: str, host: str, session_id: str | None) -> str:
-    selection = resolve_workspace_selection(api_key, host, session_id)
+def pick_workspace(api_key: str, host: str) -> str:
+    selection = resolve_workspace_selection(api_key, host)
     return selection.workspace_id

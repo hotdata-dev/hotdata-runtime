@@ -18,8 +18,6 @@ def workspace_health_lines(client: HotdataClient) -> tuple[bool, list[str]]:
             f"**workspace** `{client.workspace_id}`",
             f"**connections** {n}",
         ]
-        if client.session_id:
-            lines.append(f"**sandbox** `{client.session_id}`")
         return True, lines
     except ApiException as e:
         return False, [e.reason or str(e)]

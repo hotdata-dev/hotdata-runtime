@@ -24,8 +24,8 @@ from hotdata.models.database_default_schema_decl import DatabaseDefaultSchemaDec
 from hotdata.models.database_default_table_decl import DatabaseDefaultTableDecl
 from hotdata.models.index_info_response import IndexInfoResponse
 from hotdata.models.job_status_response import JobStatusResponse
-from hotdata.models.load_managed_table_response import LoadManagedTableResponse
 from hotdata.models.load_managed_table_request import LoadManagedTableRequest
+from hotdata.models.load_managed_table_response import LoadManagedTableResponse
 from hotdata.models.query_request import QueryRequest
 from hotdata.models.query_response import QueryResponse
 from hotdata.models.submit_job_response import SubmitJobResponse
@@ -94,6 +94,9 @@ _LOAD_INLINE_WAIT_MS = 10_000
 # and reusing the query budget is what put a five-minute ceiling on it in the
 # first place. Bounded rather than unbounded so a wedged job still surfaces.
 _LOAD_JOB_TIMEOUT_S = 3600.0
+
+# Consecutive failed status checks before a poll gives up.
+_JOB_POLL_MAX_CONSECUTIVE_ERRORS = 5
 
 
 @dataclass(frozen=True)
@@ -461,14 +464,21 @@ class HotdataClient:
             )
         except ApiException as e:
             raise RuntimeError(api_error_message(e)) from e
+        # Only the job branch is type-checked. The index path can also assert its
+        # inline type because it names it positively first; here the inline shape is
+        # read duck-typed, which callers and tests already rely on, so asserting it
+        # would narrow an interface this change has no business narrowing.
+        job_id: str | None = None
         if isinstance(loaded, SubmitJobResponse):
-            loaded = self._load_response_from_job(loaded.id)
+            job_id = loaded.id
+            loaded = self._load_response_from_job(job_id)
         return LoadManagedTableResult(
             connection_id=loaded.connection_id,
             schema_name=loaded.schema_name,
             table_name=loaded.table_name,
             row_count=loaded.row_count,
             full_name=f"{db.id}.{loaded.schema_name}.{loaded.table_name}",
+            job_id=job_id,
         )
 
     def add_managed_table(
@@ -911,11 +921,27 @@ class HotdataClient:
         jobs = self._jobs_api()
         deadline = time.monotonic() + timeout_s
         last: JobStatusResponse | None = None
+        consecutive_errors = 0
         while time.monotonic() < deadline:
             try:
                 last = jobs.get_job(job_id)
+                consecutive_errors = 0
             except ApiException as e:
-                raise RuntimeError(api_error_message(e)) from e
+                # A failed STATUS CHECK is not a failed job. Aborting here throws
+                # away work that is still running, and the caller's retry then
+                # re-submits it while the original still holds its resources -- so
+                # one blip becomes a collision with the job it just abandoned. A
+                # load polls for up to `_LOAD_JOB_TIMEOUT_S`, so the longer the
+                # wait the more chances to hit it, which is exactly backwards.
+                #
+                # CONSECUTIVE failures are the signal: an isolated 502 is noise, a
+                # run of them means the API is gone and there is nothing to wait
+                # for. The poll's own deadline bounds the total wait regardless.
+                consecutive_errors += 1
+                if consecutive_errors >= _JOB_POLL_MAX_CONSECUTIVE_ERRORS:
+                    raise RuntimeError(api_error_message(e)) from e
+                time.sleep(interval_s)
+                continue
             if last.status in _JOB_TERMINAL:
                 return last
             time.sleep(interval_s)
@@ -929,9 +955,11 @@ class HotdataClient:
 
         Polling replaces waiting on the request, so the outcome is read from
         durable state rather than from a connection that has to stay alive. That
-        also removes the ambiguity `append` was made non-retryable for: a lost
-        response no longer leaves "did it land?" unanswerable, because the job id
-        outlives the request that created it.
+        also gives a caller a handle: the job id is returned on
+        `LoadManagedTableResult`, so "did it land?" is answerable after a lost
+        response. `append` stays non-retryable -- knowing the id makes the question
+        answerable, it does not make a blind re-submission safe, and that call is
+        the caller's to make.
 
         `partially_succeeded` is terminal and carries a message, so it is raised
         rather than returned -- a caller asked for a table's contents to be
@@ -943,7 +971,9 @@ class HotdataClient:
             raise RuntimeError(
                 final.error_message or f"load job {job_id} finished {status}"
             )
-        payload = final.result.actual_instance if final.result is not None else None
+        # `result` is a oneOf wrapper today; tolerate the model arriving directly,
+        # the same way the index path does rather than disagreeing with it.
+        payload = getattr(final.result, "actual_instance", final.result)
         if not isinstance(payload, LoadManagedTableResponse):
             raise RuntimeError(
                 f"load job {job_id} succeeded without a load result "

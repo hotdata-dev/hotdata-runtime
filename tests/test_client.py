@@ -714,3 +714,91 @@ def test_a_partially_succeeded_load_job_is_not_treated_as_success():
         else:
             raise AssertionError("partially_succeeded was treated as success")
 
+
+def test_a_transient_status_check_does_not_discard_a_running_job():
+    """The regression this guards. A load polls for up to an hour, so there are
+    hundreds of status checks; aborting on the first bad one throws away a job
+    that is still running, and the caller's retry then re-submits the load while
+    the original still holds the table -- the 409 spin, from a new direction."""
+    from hotdata.exceptions import ApiException
+
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    calls = {"n": 0}
+    final = SimpleNamespace(status="succeeded", error_message=None,
+                            result=SimpleNamespace(actual_instance=_load_response(5)))
+
+    class _Flaky:
+        def get_job(self, job_id):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise ApiException(status=502, reason="Bad Gateway")
+            return final
+
+    with (
+        patch.object(client, "_jobs_api", return_value=_Flaky()),
+        patch("time.sleep", lambda *_: None),
+    ):
+        got = client._poll_job("jobs_1", timeout_s=60.0, interval_s=0.01)
+
+    assert got is final, "a blipping status check aborted the poll"
+    assert calls["n"] == 3
+
+
+def test_a_run_of_failed_status_checks_still_gives_up():
+    """Tolerance is for blips, not for an API that has gone away."""
+    from hotdata.exceptions import ApiException
+    from hotdata_framework.client import _JOB_POLL_MAX_CONSECUTIVE_ERRORS
+
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+
+    class _Dead:
+        def get_job(self, job_id):
+            raise ApiException(status=502, reason="Bad Gateway")
+
+    with (
+        patch.object(client, "_jobs_api", return_value=_Dead()),
+        patch("time.sleep", lambda *_: None),
+    ):
+        try:
+            client._poll_job("jobs_1", timeout_s=600.0, interval_s=0.01)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("polled forever against a dead API")
+    assert _JOB_POLL_MAX_CONSECUTIVE_ERRORS >= 2
+
+
+def test_a_deferred_load_returns_the_job_id_to_the_caller():
+    """`append` stays non-retryable, so the id is the only handle a caller has to
+    answer "did it land?" after a lost response -- the same reason
+    CreateIndexResult carries one."""
+    from hotdata.models.submit_job_response import SubmitJobResponse
+
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    db = ManagedDatabase(id="db_1", description="mydb", default_connection_id="conn_1")
+    connections = _FakeConnectionsApi(responses=[
+        SubmitJobResponse(id="jobs_77", status="running", status_url="/v1/jobs/jobs_77"),
+    ])
+    final = SimpleNamespace(status="succeeded", error_message=None,
+                            result=SimpleNamespace(actual_instance=_load_response()))
+
+    with (
+        patch.object(client, "_databases_api", return_value=_ForbiddenDatabasesApi()),
+        patch.object(client, "connections", return_value=connections),
+        patch.object(client, "_poll_job", return_value=final),
+    ):
+        result = client.load_managed_table(db, "orders", schema="public", upload_id="up_1")
+
+    assert result.job_id == "jobs_77"
+
+
+def test_an_inline_load_carries_no_job_id():
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    db = ManagedDatabase(id="db_1", description="mydb", default_connection_id="conn_1")
+    with (
+        patch.object(client, "_databases_api", return_value=_ForbiddenDatabasesApi()),
+        patch.object(client, "connections", return_value=_FakeConnectionsApi()),
+    ):
+        result = client.load_managed_table(db, "orders", schema="public", upload_id="up_1")
+    assert result.job_id is None
+

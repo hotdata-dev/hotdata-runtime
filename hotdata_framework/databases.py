@@ -83,6 +83,11 @@ class LoadManagedTableResult:
     table_name: str
     row_count: int
     full_name: str
+    # Set when the server ran the load as a background job. Carried for the same
+    # reason CreateIndexResult carries it: it is the only handle a caller has to
+    # ask "did that land?" after a lost response, and without it the question is
+    # unanswerable. `None` when the load finished inline.
+    job_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -640,6 +640,7 @@ def test_a_load_job_gets_its_own_budget_not_the_query_one():
     the first place; a load is the one operation whose duration scales with the
     data."""
     from hotdata.models.submit_job_response import SubmitJobResponse
+
     from hotdata_framework.client import _LOAD_JOB_TIMEOUT_S
 
     assert _LOAD_JOB_TIMEOUT_S > 300.0
@@ -744,10 +745,13 @@ def test_a_transient_status_check_does_not_discard_a_running_job():
     assert calls["n"] == 3
 
 
-def test_a_run_of_failed_status_checks_still_gives_up():
-    """Tolerance is for blips, not for an API that has gone away."""
+def test_a_sustained_run_of_failed_status_checks_gives_up_naming_the_job():
+    """Tolerance is for blips, not for an API that has gone away -- and the message
+    has to name the job, because this is one of the two paths where the caller
+    cannot tell whether the load landed. `502: Bad Gateway` alone does not."""
     from hotdata.exceptions import ApiException
-    from hotdata_framework.client import _JOB_POLL_MAX_CONSECUTIVE_ERRORS
+
+    from hotdata_framework.client import _JOB_POLL_ERROR_GRACE_S
 
     client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
 
@@ -755,17 +759,85 @@ def test_a_run_of_failed_status_checks_still_gives_up():
         def get_job(self, job_id):
             raise ApiException(status=502, reason="Bad Gateway")
 
+    # A FAKE CLOCK, advanced by the sleeps. The tolerance is measured in time, so
+    # a no-op `sleep` with a real clock would make this test wait out the whole
+    # grace period in wall time -- 120 seconds of a spinning loop to assert one
+    # message.
+    clock = {"t": 0.0}
     with (
         patch.object(client, "_jobs_api", return_value=_Dead()),
-        patch("time.sleep", lambda *_: None),
+        patch("time.monotonic", lambda: clock["t"]),
+        patch("time.sleep", lambda s: clock.__setitem__("t", clock["t"] + s)),
     ):
         try:
-            client._poll_job("jobs_1", timeout_s=600.0, interval_s=0.01)
-        except RuntimeError:
-            pass
+            client._poll_job("jobs_1", timeout_s=6000.0, interval_s=1.0)
+        except RuntimeError as e:
+            assert "jobs_1" in str(e), f"gave up without naming the job: {e}"
         else:
             raise AssertionError("polled forever against a dead API")
-    assert _JOB_POLL_MAX_CONSECUTIVE_ERRORS >= 2
+    assert clock["t"] >= _JOB_POLL_ERROR_GRACE_S, "gave up before the grace elapsed"
+    assert clock["t"] < 6000.0, "ran to the poll deadline instead of the grace"
+
+
+def test_the_error_tolerance_is_measured_in_time_not_checks():
+    """A count means whatever the caller's `interval_s` makes it, and callers
+    differ. The thing being survived is a gateway blip, which lasts seconds to
+    minutes regardless of how often we happen to ask."""
+    from hotdata_framework.client import _JOB_POLL_ERROR_GRACE_S
+
+    # long enough to outlast a rolling restart / LB reconverge, not seconds
+    assert _JOB_POLL_ERROR_GRACE_S >= 60.0
+
+
+def test_failed_status_checks_back_off_instead_of_hammering():
+    """Whatever is serving 502s does not need the extra traffic."""
+    from hotdata.exceptions import ApiException
+
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    sleeps: list[float] = []
+    calls = {"n": 0}
+    final = SimpleNamespace(status="succeeded", error_message=None,
+                            result=SimpleNamespace(actual_instance=_load_response()))
+
+    class _Flaky:
+        def get_job(self, job_id):
+            calls["n"] += 1
+            if calls["n"] < 5:
+                raise ApiException(status=502, reason="Bad Gateway")
+            return final
+
+    with (
+        patch.object(client, "_jobs_api", return_value=_Flaky()),
+        patch("time.sleep", lambda s: sleeps.append(s)),
+    ):
+        client._poll_job("jobs_1", timeout_s=600.0, interval_s=1.0)
+
+    failed_waits = sleeps[:4]
+    assert failed_waits == sorted(failed_waits), f"did not back off: {failed_waits}"
+    assert failed_waits[-1] > failed_waits[0]
+
+
+def test_a_failed_load_job_names_the_job_alongside_the_server_message():
+    from hotdata.models.submit_job_response import SubmitJobResponse
+
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    db = ManagedDatabase(id="db_1", description="mydb", default_connection_id="conn_1")
+    connections = _FakeConnectionsApi(responses=[
+        SubmitJobResponse(id="jobs_42", status="running", status_url="/v1/jobs/jobs_42"),
+    ])
+    final = SimpleNamespace(status="failed", error_message="disk full", result=None)
+
+    with (
+        patch.object(client, "_databases_api", return_value=_ForbiddenDatabasesApi()),
+        patch.object(client, "connections", return_value=connections),
+        patch.object(client, "_poll_job", return_value=final),
+    ):
+        try:
+            client.load_managed_table(db, "orders", schema="public", upload_id="up_1")
+        except RuntimeError as e:
+            assert "disk full" in str(e) and "jobs_42" in str(e), e
+        else:
+            raise AssertionError("a failed load job did not raise")
 
 
 def test_a_deferred_load_returns_the_job_id_to_the_caller():

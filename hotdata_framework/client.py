@@ -95,8 +95,23 @@ _LOAD_INLINE_WAIT_MS = 10_000
 # first place. Bounded rather than unbounded so a wedged job still surfaces.
 _LOAD_JOB_TIMEOUT_S = 3600.0
 
-# Consecutive failed status checks before a poll gives up.
-_JOB_POLL_MAX_CONSECUTIVE_ERRORS = 5
+# How long a poll tolerates CONTINUOUS status-check failure before giving up.
+#
+# Time, not a count: a count means whatever the caller's `interval_s` makes it,
+# and callers differ -- five checks is eight seconds at the load interval and
+# something else at the index one. The thing being survived is a gateway blip,
+# and a rolling restart or a load balancer reconverging routinely serves 502s for
+# longer than a few seconds. Too short and the poll aborts, the caller's retry
+# re-submits the load, and the original job is still holding the table -- the
+# door this tolerance exists to close.
+#
+# Still bounded by the poll's own deadline, so this only decides how a stretch of
+# failures ends, never how long the wait can be.
+_JOB_POLL_ERROR_GRACE_S = 120.0
+
+# Failed checks back off rather than hammering at `interval_s`: whatever is
+# serving 502s does not need the extra traffic.
+_JOB_POLL_ERROR_MAX_BACKOFF_S = 15.0
 
 
 @dataclass(frozen=True)
@@ -921,11 +936,14 @@ class HotdataClient:
         jobs = self._jobs_api()
         deadline = time.monotonic() + timeout_s
         last: JobStatusResponse | None = None
-        consecutive_errors = 0
+        # When the current run of failures began, or None while checks succeed.
+        failing_since: float | None = None
+        error_backoff = interval_s
         while time.monotonic() < deadline:
             try:
                 last = jobs.get_job(job_id)
-                consecutive_errors = 0
+                failing_since = None
+                error_backoff = interval_s
             except ApiException as e:
                 # A failed STATUS CHECK is not a failed job. Aborting here throws
                 # away work that is still running, and the caller's retry then
@@ -937,10 +955,20 @@ class HotdataClient:
                 # CONSECUTIVE failures are the signal: an isolated 502 is noise, a
                 # run of them means the API is gone and there is nothing to wait
                 # for. The poll's own deadline bounds the total wait regardless.
-                consecutive_errors += 1
-                if consecutive_errors >= _JOB_POLL_MAX_CONSECUTIVE_ERRORS:
-                    raise RuntimeError(api_error_message(e)) from e
-                time.sleep(interval_s)
+                now = time.monotonic()
+                if failing_since is None:
+                    failing_since = now
+                elif now - failing_since >= _JOB_POLL_ERROR_GRACE_S:
+                    # Name the job. This is one of the two paths where the caller
+                    # cannot tell whether the load landed, so the id is the only
+                    # thing that makes the question answerable -- and it is exactly
+                    # what a message like "502: Bad Gateway" leaves out.
+                    raise RuntimeError(
+                        f"Job {job_id} status checks failed for "
+                        f"{_JOB_POLL_ERROR_GRACE_S:.0f}s: {api_error_message(e)}"
+                    ) from e
+                time.sleep(error_backoff)
+                error_backoff = min(error_backoff * 2, _JOB_POLL_ERROR_MAX_BACKOFF_S)
                 continue
             if last.status in _JOB_TERMINAL:
                 return last
@@ -968,9 +996,11 @@ class HotdataClient:
         final = self._poll_job(job_id, timeout_s=_LOAD_JOB_TIMEOUT_S)
         status = enum_value(final.status)
         if status != "succeeded":
-            raise RuntimeError(
-                final.error_message or f"load job {job_id} finished {status}"
-            )
+            # The id goes in whether or not the server's message mentions it: the
+            # caller is being told the load did not succeed, and "which load" is
+            # the next thing it needs.
+            detail = final.error_message or f"finished {status}"
+            raise RuntimeError(f"load job {job_id} {status}: {detail}")
         # `result` is a oneOf wrapper today; tolerate the model arriving directly,
         # the same way the index path does rather than disagreeing with it.
         payload = getattr(final.result, "actual_instance", final.result)

@@ -37,11 +37,16 @@ class _ForbiddenDatabasesApi:
 
 
 class _FakeConnectionsApi:
-    def __init__(self) -> None:
+    def __init__(self, responses=None) -> None:
         self.load_calls: list[tuple[str, str, str]] = []
+        self.requests: list = []
+        self._responses = list(responses) if responses else None
 
     def load_managed_table(self, connection_id, schema, table, request):
         self.load_calls.append((connection_id, schema, table))
+        self.requests.append(request)
+        if self._responses:
+            return self._responses.pop(0)
         return SimpleNamespace(
             connection_id=connection_id,
             schema_name=schema,
@@ -544,3 +549,168 @@ def test_from_env_requires_an_api_key(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("HOTDATA_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="HOTDATA_API_KEY"):
         HotdataClient.from_env()
+
+
+# --------------------------------------------------------------------------
+# A load is submitted as a job, not held open on one request
+# --------------------------------------------------------------------------
+
+
+def _load_response(rows=7):
+    from hotdata.models.load_managed_table_response import LoadManagedTableResponse
+
+    return LoadManagedTableResponse(
+        connection_id="conn_1", schema_name="public",
+        table_name="orders", row_count=rows,
+        arrow_schema_json="{}",
+    )
+
+
+def test_a_load_asks_for_a_job_with_an_inline_window():
+    """The request itself is the fix. A load whose duration scales with the data
+    must not depend on one HTTP request surviving minutes through every layer
+    between here and the engine; when such a request dies the server discards the
+    work and leaves the table locked against the retry."""
+    from hotdata_framework.client import _LOAD_INLINE_WAIT_MS
+
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    db = ManagedDatabase(id="db_1", description="mydb", default_connection_id="conn_1")
+    connections = _FakeConnectionsApi()
+
+    with (
+        patch.object(client, "_databases_api", return_value=_ForbiddenDatabasesApi()),
+        patch.object(client, "connections", return_value=connections),
+    ):
+        client.load_managed_table(db, "orders", schema="public", upload_id="up_1")
+
+    req = connections.requests[0]
+    assert req.var_async is True, "load was not submitted as a job"
+    assert req.async_after_ms == _LOAD_INLINE_WAIT_MS
+
+
+def test_a_load_that_finishes_inline_costs_no_polling():
+    """dlt's bookkeeping tables settle in under a second. Making those pay a
+    submit-then-poll round trip would be a regression, which is what
+    `async_after_ms` exists to prevent."""
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    db = ManagedDatabase(id="db_1", description="mydb", default_connection_id="conn_1")
+    connections = _FakeConnectionsApi()
+
+    def _forbidden_poll(*a, **k):
+        raise AssertionError("polled a load the server answered inline")
+
+    with (
+        patch.object(client, "_databases_api", return_value=_ForbiddenDatabasesApi()),
+        patch.object(client, "connections", return_value=connections),
+        patch.object(client, "_poll_job", _forbidden_poll),
+    ):
+        result = client.load_managed_table(db, "orders", schema="public", upload_id="up_1")
+
+    assert result.row_count == 3
+
+
+def test_a_load_the_server_defers_is_polled_to_completion():
+    """The 202 path: the result comes from durable job state rather than from a
+    connection that had to stay alive to carry it."""
+    from hotdata.models.submit_job_response import SubmitJobResponse
+
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    db = ManagedDatabase(id="db_1", description="mydb", default_connection_id="conn_1")
+    connections = _FakeConnectionsApi(responses=[
+        SubmitJobResponse(id="jobs_1", status="running", status_url="/v1/jobs/jobs_1"),
+    ])
+    final = SimpleNamespace(
+        status="succeeded", error_message=None,
+        result=SimpleNamespace(actual_instance=_load_response(rows=91)),
+    )
+
+    with (
+        patch.object(client, "_databases_api", return_value=_ForbiddenDatabasesApi()),
+        patch.object(client, "connections", return_value=connections),
+        patch.object(client, "_poll_job", return_value=final) as poll,
+    ):
+        result = client.load_managed_table(db, "orders", schema="public", upload_id="up_1")
+
+    assert result.row_count == 91
+    assert poll.call_args.args[0] == "jobs_1"
+
+
+def test_a_load_job_gets_its_own_budget_not_the_query_one():
+    """Reusing the 300s query budget is what put a five-minute ceiling on loads in
+    the first place; a load is the one operation whose duration scales with the
+    data."""
+    from hotdata.models.submit_job_response import SubmitJobResponse
+    from hotdata_framework.client import _LOAD_JOB_TIMEOUT_S
+
+    assert _LOAD_JOB_TIMEOUT_S > 300.0
+
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    db = ManagedDatabase(id="db_1", description="mydb", default_connection_id="conn_1")
+    connections = _FakeConnectionsApi(responses=[
+        SubmitJobResponse(id="jobs_1", status="running", status_url="/v1/jobs/jobs_1"),
+    ])
+    final = SimpleNamespace(
+        status="succeeded", error_message=None,
+        result=SimpleNamespace(actual_instance=_load_response()),
+    )
+
+    with (
+        patch.object(client, "_databases_api", return_value=_ForbiddenDatabasesApi()),
+        patch.object(client, "connections", return_value=connections),
+        patch.object(client, "_poll_job", return_value=final) as poll,
+    ):
+        client.load_managed_table(db, "orders", schema="public", upload_id="up_1")
+
+    assert poll.call_args.kwargs["timeout_s"] == _LOAD_JOB_TIMEOUT_S
+
+
+def test_a_failed_load_job_raises_with_the_server_message():
+    from hotdata.models.submit_job_response import SubmitJobResponse
+
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    db = ManagedDatabase(id="db_1", description="mydb", default_connection_id="conn_1")
+    connections = _FakeConnectionsApi(responses=[
+        SubmitJobResponse(id="jobs_1", status="running", status_url="/v1/jobs/jobs_1"),
+    ])
+    final = SimpleNamespace(status="failed", error_message="disk full", result=None)
+
+    with (
+        patch.object(client, "_databases_api", return_value=_ForbiddenDatabasesApi()),
+        patch.object(client, "connections", return_value=connections),
+        patch.object(client, "_poll_job", return_value=final),
+    ):
+        try:
+            client.load_managed_table(db, "orders", schema="public", upload_id="up_1")
+        except RuntimeError as e:
+            assert "disk full" in str(e), e
+        else:
+            raise AssertionError("a failed load job did not raise")
+
+
+def test_a_partially_succeeded_load_job_is_not_treated_as_success():
+    """A caller asked for a table's contents to be replaced or appended to;
+    "some of it" is not an answer it can use."""
+    from hotdata.models.submit_job_response import SubmitJobResponse
+
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    db = ManagedDatabase(id="db_1", description="mydb", default_connection_id="conn_1")
+    connections = _FakeConnectionsApi(responses=[
+        SubmitJobResponse(id="jobs_1", status="running", status_url="/v1/jobs/jobs_1"),
+    ])
+    final = SimpleNamespace(
+        status="partially_succeeded", error_message="3 rows rejected",
+        result=SimpleNamespace(actual_instance=_load_response()),
+    )
+
+    with (
+        patch.object(client, "_databases_api", return_value=_ForbiddenDatabasesApi()),
+        patch.object(client, "connections", return_value=connections),
+        patch.object(client, "_poll_job", return_value=final),
+    ):
+        try:
+            client.load_managed_table(db, "orders", schema="public", upload_id="up_1")
+        except RuntimeError as e:
+            assert "3 rows rejected" in str(e), e
+        else:
+            raise AssertionError("partially_succeeded was treated as success")
+

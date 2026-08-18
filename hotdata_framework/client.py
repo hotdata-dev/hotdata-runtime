@@ -25,6 +25,7 @@ from hotdata.models.database_default_table_decl import DatabaseDefaultTableDecl
 from hotdata.models.index_info_response import IndexInfoResponse
 from hotdata.models.job_status_response import JobStatusResponse
 from hotdata.models.load_managed_table_request import LoadManagedTableRequest
+from hotdata.models.load_managed_table_response import LoadManagedTableResponse
 from hotdata.models.query_request import QueryRequest
 from hotdata.models.query_response import QueryResponse
 from hotdata.models.submit_job_response import SubmitJobResponse
@@ -80,6 +81,37 @@ _TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 _RESULT_FAILURE = frozenset({"failed", "cancelled"})
 # Jobs have no "cancelled" state; "partially_succeeded" carries an error_message.
 _JOB_TERMINAL = frozenset({"succeeded", "partially_succeeded", "failed"})
+
+# How long a load may finish INLINE before the server hands back a job instead.
+# Small enough that a slow load stops holding a request open, large enough that
+# the overwhelming majority never become jobs at all: dlt's bookkeeping tables
+# (`_dlt_version`, `_dlt_loads`, `_dlt_pipeline_state`) settle in under a second,
+# and paying a submit-then-poll round trip for those would be a regression.
+_LOAD_INLINE_WAIT_MS = 10_000
+
+# A load's own polling budget. Deliberately NOT the 300s used for queries and
+# results: a load is the one operation here whose duration scales with the data,
+# and reusing the query budget is what put a five-minute ceiling on it in the
+# first place. Bounded rather than unbounded so a wedged job still surfaces.
+_LOAD_JOB_TIMEOUT_S = 3600.0
+
+# How long a poll tolerates CONTINUOUS status-check failure before giving up.
+#
+# Time, not a count: a count means whatever the caller's `interval_s` makes it,
+# and callers differ -- five checks is eight seconds at the load interval and
+# something else at the index one. The thing being survived is a gateway blip,
+# and a rolling restart or a load balancer reconverging routinely serves 502s for
+# longer than a few seconds. Too short and the poll aborts, the caller's retry
+# re-submits the load, and the original job is still holding the table -- the
+# door this tolerance exists to close.
+#
+# Still bounded by the poll's own deadline, so this only decides how a stretch of
+# failures ends, never how long the wait can be.
+_JOB_POLL_ERROR_GRACE_S = 120.0
+
+# Failed checks back off rather than hammering at `interval_s`: whatever is
+# serving 502s does not need the extra traffic.
+_JOB_POLL_ERROR_MAX_BACKOFF_S = 15.0
 
 
 @dataclass(frozen=True)
@@ -418,10 +450,25 @@ class HotdataClient:
         else:
             assert file is not None
             resolved_upload_id = self.upload_parquet(file)
+        # ASKED FOR AS A JOB, not as a held-open request. A load's duration scales
+        # with the data, and a single request that must survive minutes has to
+        # survive every layer between here and the engine -- CDN, gateway, socket
+        # read timeout -- any one of which ends it. When it ends, the server logs
+        # the load `abandoned` and DISCARDS work it had already done, while the
+        # table's write lock is still held against the retry that follows; the
+        # retry then collides with it (409 RESOURCE_LOCKED) and the pair can spin
+        # indefinitely without the load ever completing. Observed in production on
+        # a table whose load runs past five minutes.
+        #
+        # `async_after_ms` keeps the common case unchanged: the server answers 200
+        # with the result if it finishes inside the window, and only falls back to
+        # a job when it does not. So nothing pays for polling that did not need it.
         request = LoadManagedTableRequest(
             mode=mode,
             upload_id=resolved_upload_id,
             key=key,
+            var_async=True,
+            async_after_ms=_LOAD_INLINE_WAIT_MS,
         )
         try:
             loaded = self.connections().load_managed_table(
@@ -432,12 +479,21 @@ class HotdataClient:
             )
         except ApiException as e:
             raise RuntimeError(api_error_message(e)) from e
+        # Only the job branch is type-checked. The index path can also assert its
+        # inline type because it names it positively first; here the inline shape is
+        # read duck-typed, which callers and tests already rely on, so asserting it
+        # would narrow an interface this change has no business narrowing.
+        job_id: str | None = None
+        if isinstance(loaded, SubmitJobResponse):
+            job_id = loaded.id
+            loaded = self._load_response_from_job(job_id)
         return LoadManagedTableResult(
             connection_id=loaded.connection_id,
             schema_name=loaded.schema_name,
             table_name=loaded.table_name,
             row_count=loaded.row_count,
             full_name=f"{db.id}.{loaded.schema_name}.{loaded.table_name}",
+            job_id=job_id,
         )
 
     def add_managed_table(
@@ -880,11 +936,40 @@ class HotdataClient:
         jobs = self._jobs_api()
         deadline = time.monotonic() + timeout_s
         last: JobStatusResponse | None = None
+        # When the current run of failures began, or None while checks succeed.
+        failing_since: float | None = None
+        error_backoff = interval_s
         while time.monotonic() < deadline:
             try:
                 last = jobs.get_job(job_id)
+                failing_since = None
+                error_backoff = interval_s
             except ApiException as e:
-                raise RuntimeError(api_error_message(e)) from e
+                # A failed STATUS CHECK is not a failed job. Aborting here throws
+                # away work that is still running, and the caller's retry then
+                # re-submits it while the original still holds its resources -- so
+                # one blip becomes a collision with the job it just abandoned. A
+                # load polls for up to `_LOAD_JOB_TIMEOUT_S`, so the longer the
+                # wait the more chances to hit it, which is exactly backwards.
+                #
+                # CONSECUTIVE failures are the signal: an isolated 502 is noise, a
+                # run of them means the API is gone and there is nothing to wait
+                # for. The poll's own deadline bounds the total wait regardless.
+                now = time.monotonic()
+                if failing_since is None:
+                    failing_since = now
+                elif now - failing_since >= _JOB_POLL_ERROR_GRACE_S:
+                    # Name the job. This is one of the two paths where the caller
+                    # cannot tell whether the load landed, so the id is the only
+                    # thing that makes the question answerable -- and it is exactly
+                    # what a message like "502: Bad Gateway" leaves out.
+                    raise RuntimeError(
+                        f"Job {job_id} status checks failed for "
+                        f"{_JOB_POLL_ERROR_GRACE_S:.0f}s: {api_error_message(e)}"
+                    ) from e
+                time.sleep(error_backoff)
+                error_backoff = min(error_backoff * 2, _JOB_POLL_ERROR_MAX_BACKOFF_S)
+                continue
             if last.status in _JOB_TERMINAL:
                 return last
             time.sleep(interval_s)
@@ -892,6 +977,39 @@ class HotdataClient:
         raise TimeoutError(
             f"Job {job_id} did not finish within {timeout_s}s (last status: {last_status})"
         )
+
+    def _load_response_from_job(self, job_id: str) -> LoadManagedTableResponse:
+        """The result of a load the server chose to run as a job.
+
+        Polling replaces waiting on the request, so the outcome is read from
+        durable state rather than from a connection that has to stay alive. That
+        also gives a caller a handle: the job id is returned on
+        `LoadManagedTableResult`, so "did it land?" is answerable after a lost
+        response. `append` stays non-retryable -- knowing the id makes the question
+        answerable, it does not make a blind re-submission safe, and that call is
+        the caller's to make.
+
+        `partially_succeeded` is terminal and carries a message, so it is raised
+        rather than returned -- a caller asked for a table's contents to be
+        replaced or appended to, and "some of it" is not an answer it can use.
+        """
+        final = self._poll_job(job_id, timeout_s=_LOAD_JOB_TIMEOUT_S)
+        status = enum_value(final.status)
+        if status != "succeeded":
+            # The id goes in whether or not the server's message mentions it: the
+            # caller is being told the load did not succeed, and "which load" is
+            # the next thing it needs.
+            detail = final.error_message or f"finished {status}"
+            raise RuntimeError(f"load job {job_id} {status}: {detail}")
+        # `result` is a oneOf wrapper today; tolerate the model arriving directly,
+        # the same way the index path does rather than disagreeing with it.
+        payload = getattr(final.result, "actual_instance", final.result)
+        if not isinstance(payload, LoadManagedTableResponse):
+            raise RuntimeError(
+                f"load job {job_id} succeeded without a load result "
+                f"(got {type(payload).__name__})"
+            )
+        return payload
 
     def _wait_result_ready(
         self,

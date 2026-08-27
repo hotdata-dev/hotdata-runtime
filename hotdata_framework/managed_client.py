@@ -7,6 +7,7 @@ in one place rather than being duplicated per adapter.
 
 from __future__ import annotations
 
+import random
 import time
 from collections.abc import Callable
 from typing import Any, Protocol, TypeVar
@@ -53,6 +54,10 @@ class ManagedDatabaseClient:
     _QUERY_TIMEOUT_SECONDS = 300.0
     _POLL_INTERVAL_SECONDS = 0.4
     _MAX_BACKOFF_SECONDS = 30.0
+    # Spread as a fraction of the wait, added on top of it. Half an interval is
+    # enough to decorrelate writers that started together without materially
+    # changing how long the budget lasts.
+    _RETRY_JITTER_FRACTION = 0.5
 
     def __init__(
         self,
@@ -207,9 +212,16 @@ class ManagedDatabaseClient:
         mode: ManagedLoadMode = "replace",
         key: list[str] | None = None,
     ) -> LoadManagedTableResult:
-        # append is the only non-idempotent mode: if the server commits the load
-        # but the response is lost, a retry re-appends the same rows. Run it
-        # at-most-once; every other mode is safe to retry.
+        # Retryable in every mode, append included. A retry re-sends the SAME
+        # upload_id, and the server keys a receipt on it: a replay returns the
+        # committed result rather than applying the load a second time. So the
+        # invariant that makes this safe is the upload id, not the mode — a
+        # caller that re-stages the upload between attempts mints a new id,
+        # loses the receipt, and a retried append would then duplicate rows.
+        # This client stages once, in upload_parquet, outside the operation
+        # retried here. `HotdataClient.load_managed_table(file=...)` uploads
+        # inside the call and so does not hold the invariant; it is unwrapped,
+        # and retrying an append through it is the caller's to justify.
         #
         # `key` is the merge key for delete/update/upsert loads: when set it is
         # matched per-load instead of a key declared at table creation. Omit it
@@ -222,20 +234,40 @@ class ManagedDatabaseClient:
                 upload_id=upload_id,
                 mode=mode,
                 key=key,
-            ),
-            retryable=(mode != "append"),
+            )
         )
 
-    def _request_with_retry(self, operation: Callable[[], T], *, retryable: bool = True) -> T:
-        max_attempts = self._max_retries if retryable else 1
+    def _request_with_retry(self, operation: Callable[[], T]) -> T:
+        max_attempts = self._max_retries
         for attempt in range(1, max_attempts + 1):
             try:
                 return operation()
             except Exception as error:
                 mapped_error = classify_sdk_error(error.__cause__ or error)
                 if isinstance(mapped_error, HotdataTransientError) and attempt < max_attempts:
-                    backoff = min(self._retry_backoff_seconds * attempt, self._MAX_BACKOFF_SECONDS)
-                    time.sleep(backoff)
+                    time.sleep(self._retry_delay(attempt, mapped_error.retry_after_seconds))
                     continue
                 raise mapped_error from error
         raise RuntimeError("No retry attempts configured")
+
+    def _retry_delay(self, attempt: int, retry_after_seconds: float | None) -> float:
+        """A linear ramp, floored by the server's Retry-After and spread by jitter.
+
+        Retry-After is a floor rather than a replacement: it says how long the
+        condition just refused typically lasts, while the ramp is what gives up
+        eventually, and taking the larger of the two honours both. It is capped
+        like the ramp so a hostile or mistaken header cannot park an attempt for
+        an hour.
+
+        Jitter is added on top and never subtracted, so a stated Retry-After is
+        not undercut. It matters because the callers that collide are the ones
+        that started together: writers refused by one table's lock would retry
+        in lockstep on an identical ramp and re-collide every time.
+        _MAX_BACKOFF_SECONDS caps the ramp, deliberately not the jitter above
+        it — clamping the total would flatten every late attempt onto the same
+        value and re-correlate exactly the waits that most need spreading.
+        """
+        base = min(self._retry_backoff_seconds * attempt, self._MAX_BACKOFF_SECONDS)
+        if retry_after_seconds is not None:
+            base = max(base, min(retry_after_seconds, self._MAX_BACKOFF_SECONDS))
+        return base * (1.0 + random.random() * self._RETRY_JITTER_FRACTION)

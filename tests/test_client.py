@@ -841,9 +841,8 @@ def test_a_failed_load_job_names_the_job_alongside_the_server_message():
 
 
 def test_a_deferred_load_returns_the_job_id_to_the_caller():
-    """`append` stays non-retryable, so the id is the only handle a caller has to
-    answer "did it land?" after a lost response -- the same reason
-    CreateIndexResult carries one."""
+    """The id is the handle a caller has to answer "did it land?" after a lost
+    response -- the same reason CreateIndexResult carries one."""
     from hotdata.models.submit_job_response import SubmitJobResponse
 
     client = HotdataClient("k", "ws", host="https://api.hotdata.dev")

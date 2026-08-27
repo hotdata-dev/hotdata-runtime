@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- fix(load): retry an `append` load instead of running it at most once.
+
+  `append` was excluded from retries on the grounds that it is not idempotent:
+  if the server commits but the response is lost, a retry would duplicate rows.
+  That is not how the server behaves. It keys a receipt on `upload_id`, and a
+  re-POST of the same id replays the committed result instead of applying the
+  load again — so what makes a retry safe is re-sending the same upload, not
+  the mode. This client stages once, in `upload_parquet`, outside the retried
+  operation, so the invariant holds for every mode.
+
+  The exclusion cost real availability. The destination serialises writes per
+  table and refuses rather than queues, so concurrent writers to one table get
+  `409 RESOURCE_LOCKED` — and an append had no budget to wait it out, whatever
+  `max_retries` the caller had configured.
+
+  `HotdataClient.load_managed_table(file=...)` uploads inside the call and so
+  does not hold the invariant. It is unwrapped and unaffected.
+
+- fix(errors): classify a 409 by its `error.code` rather than by the status alone.
+
+  `CONFLICT` is now terminal: it means the request cannot succeed as posted, so
+  the previous behaviour spent the entire retry budget arriving at the same
+  answer. `RESOURCE_LOCKED` stays transient. A 409 with no error envelope — a
+  failed query result, say — is classified as before.
+
+- fix(retry): honour `Retry-After`, and jitter the backoff.
+
+  `Retry-After` is taken as a floor on the ramp, capped like the ramp so a bad
+  header cannot park an attempt for an hour. Jitter of up to +50% is added on
+  top and never subtracted, so a stated `Retry-After` is not undercut. Without
+  it, writers that collided on one table retry in lockstep and collide again.
+
+  This lengthens a 20-attempt budget from 285s to roughly 316-405s.
+
+- docs: scope the "a load is not idempotent" claim in the README and in
+  `test_retry_policy` to the transport layer, which is where it is still true
+  and where those two were always talking about. Left unscoped they read as
+  repo-wide and contradict the call-layer retry above.
+
+### Added
+
+- `HotdataError` carries `status_code`, `code` and `retry_after_seconds`. The
+  message is flattened and truncated for readability, so it could not serve as
+  a discriminator; these can.
 
 ## [0.12.1] - 2026-08-18
 

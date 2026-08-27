@@ -8,8 +8,10 @@ from typing import Any
 import pyarrow as pa
 import pytest
 from hotdata.models.query_response import QueryResponse
+from hotdata.rest import ApiException
 
 import hotdata_framework.managed_client as mc
+from hotdata_framework.errors import HotdataTerminalError
 
 
 def _query_response(result_id: str) -> QueryResponse:
@@ -158,9 +160,7 @@ def test_fetch_table_carries_database_scope_on_result_reads(
     assert arrow_scopes == ["db1"]
 
 
-def _load_recording_runtime(
-    calls: list[str], uploads: list[str] | None = None
-) -> SimpleNamespace:
+def _load_recording_runtime(calls: list[str], uploads: list[str] | None = None) -> SimpleNamespace:
     """A runtime whose ``load_managed_table`` records each mode and always fails
     with a transient error, so retry behaviour is observable via ``calls``.
 
@@ -180,6 +180,32 @@ def _load_recording_runtime(
         if uploads is not None:
             uploads.append(upload_id)
         raise TimeoutError("commit succeeded but response was lost")
+
+    runtime = _fake_runtime()
+    runtime.load_managed_table = load_managed_table
+    return runtime
+
+
+def _lock_refusing_runtime(retry_after: str | None) -> SimpleNamespace:
+    """A runtime whose loads are refused the way the API refuses a contended
+    table: ``409 RESOURCE_LOCKED``, optionally carrying ``Retry-After``."""
+
+    def load_managed_table(
+        database: str,
+        table: str,
+        *,
+        schema: str,
+        upload_id: str,
+        mode: str,
+        key: list[str] | None = None,
+    ) -> SimpleNamespace:
+        error = ApiException(
+            status=409,
+            reason="Conflict",
+            body='{"error":{"code":"RESOURCE_LOCKED","message":"retry shortly"}}',
+        )
+        error.headers = {"Retry-After": retry_after} if retry_after else {}
+        raise error
 
     runtime = _fake_runtime()
     runtime.load_managed_table = load_managed_table
@@ -245,6 +271,78 @@ def test_idempotent_load_retries_on_transient(monkeypatch: pytest.MonkeyPatch) -
         client.load_managed_table("db", "orders", schema="public", upload_id="u1", mode="replace")
 
     assert calls == ["replace", "replace", "replace"]  # retried up to max_retries
+
+
+def test_a_lock_refusal_is_retried_and_waits_the_header_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end for the contended-table case: a `409 RESOURCE_LOCKED` is
+    classified transient, retried, and each wait honours the `Retry-After` the
+    refusal carried.
+
+    Worth having as one test rather than three: `_retry_delay` is exercised
+    directly elsewhere, but nothing else covers the wiring that carries the
+    header off the error and into the sleep. The other retry tests stub sleep
+    with a lambda that discards its argument, so a regression passing `None`
+    here — or swapping the two positional arguments — would leave them green."""
+    slept: list[float] = []
+    monkeypatch.setattr(mc.time, "sleep", lambda seconds: slept.append(seconds))
+    monkeypatch.setattr(mc.random, "random", lambda: 0.0)
+    client = _managed_client(max_retries=4)
+    client._retry_backoff_seconds = 1.5
+    client._runtime = _lock_refusing_runtime(retry_after="5")
+
+    with pytest.raises(mc.HotdataTransientError):
+        client.load_managed_table("db", "orders", schema="public", upload_id="u1", mode="append")
+
+    # Four attempts, so three waits — each floored on the header rather than
+    # taking the ramp's 1.5s / 3.0s / 4.5s.
+    assert slept == [5.0, 5.0, 5.0]
+
+
+def test_a_lock_refusal_without_a_header_falls_back_to_the_ramp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The floor is the header's contribution, not a hard-coded one: with no
+    header the ramp decides, which keeps the refusal path working against a
+    server that does not state a wait."""
+    slept: list[float] = []
+    monkeypatch.setattr(mc.time, "sleep", lambda seconds: slept.append(seconds))
+    monkeypatch.setattr(mc.random, "random", lambda: 0.0)
+    client = _managed_client(max_retries=4)
+    client._retry_backoff_seconds = 1.5
+    client._runtime = _lock_refusing_runtime(retry_after=None)
+
+    with pytest.raises(mc.HotdataTransientError):
+        client.load_managed_table("db", "orders", schema="public", upload_id="u1", mode="append")
+
+    assert slept == [1.5, 3.0, 4.5]
+
+
+def test_a_permanent_conflict_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A `CONFLICT` cannot succeed as posted, so it surfaces on the first
+    attempt instead of spending the budget to reach the same 409."""
+    monkeypatch.setattr(mc.time, "sleep", lambda _seconds: None)
+    attempts: list[int] = []
+
+    def load_managed_table(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        attempts.append(1)
+        error = ApiException(
+            status=409,
+            reason="Conflict",
+            body='{"error":{"code":"CONFLICT","message":"upload already consumed"}}',
+        )
+        error.headers = {}
+        raise error
+
+    client = _managed_client(max_retries=8)
+    client._runtime = _fake_runtime()
+    client._runtime.load_managed_table = load_managed_table
+
+    with pytest.raises(HotdataTerminalError):
+        client.load_managed_table("db", "orders", schema="public", upload_id="u1", mode="append")
+
+    assert len(attempts) == 1
 
 
 def test_retry_delay_floors_on_the_servers_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:

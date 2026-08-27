@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   This lengthens a 20-attempt budget from 285s to roughly 316-405s.
 
+- docs: scope the "a load is not idempotent" claim in the README and in
+  `test_retry_policy` to the transport layer, which is where it is still true
+  and where those two were always talking about. Left unscoped they read as
+  repo-wide and contradict the call-layer retry above.
+
 ### Added
 
 - `HotdataError` carries `status_code`, `code` and `retry_after_seconds`. The

@@ -10,7 +10,7 @@ Runtime boundary and guarantees are defined in `CONTRACT.md`.
 
 - **Environment-driven client setup** — create clients from `HOTDATA_API_KEY`, optional `HOTDATA_API_URL`, and `HOTDATA_WORKSPACE`.
 - **Workspace resolution** — choose an explicit workspace from env, otherwise discover workspaces and select the active workspace or first available workspace.
-- **HTTP resilience** — retry SQL execution on stale pooled sockets. Transport-level retries are the SDK's own default, which this package leaves in place so a non-idempotent request is never replayed on a response status.
+- **HTTP resilience** — retry SQL execution on stale pooled sockets. Transport-level retries are the SDK's own default, which this package leaves in place so a request is never blindly replayed on a response status. That is a claim about the transport, which cannot know what it would be replaying. `ManagedDatabaseClient` retries at the call layer, which can: a managed load is safe to re-send because it carries the same `upload_id` and the API replays its receipt for that id rather than applying the load twice.
 - **SQL execution helper** — run SQL through `POST /v1/query`, poll async query runs when needed, and return a `QueryResult`.
 - **Result utilities** — convert query results to records, pandas DataFrames, or metadata dictionaries for adapter display layers.
 - **History helpers** — list recent results and query run history with normalized dataclasses.

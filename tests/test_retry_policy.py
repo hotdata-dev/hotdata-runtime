@@ -1,8 +1,14 @@
-"""A POST must never be replayed because of a response status.
+"""A POST must never be replayed *by the transport* because of a response status.
 
-A load is not idempotent: re-sending one that the server is still working on
-collides with the write lock the first attempt holds, and the duplicate is
-refused. The generated SDK already draws this line — ``hotdata._retry`` retries
+Re-sending a load the server is still working on collides with the write lock
+the first attempt holds, and the duplicate is refused — so a blind transport
+replay buys nothing and spends an attempt. This is a claim about the transport,
+which sees a method and a status and cannot know what it would be re-sending.
+It is not a claim that loads must never be retried: ``ManagedDatabaseClient``
+retries them at the call layer, where the same ``upload_id`` goes back out and
+the API replays its receipt for that id instead of applying the load twice.
+
+The generated SDK already draws this line — ``hotdata._retry`` retries
 a *pre-response* connection reset on any method (the stale pooled socket case,
 where the server did no work) while leaving read timeouts and status retries
 idempotent-only. This wrapper used to pass its own ``retries=`` into

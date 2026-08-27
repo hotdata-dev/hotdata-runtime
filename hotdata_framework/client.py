@@ -985,9 +985,11 @@ class HotdataClient:
         durable state rather than from a connection that has to stay alive. That
         also gives a caller a handle: the job id is returned on
         `LoadManagedTableResult`, so "did it land?" is answerable after a lost
-        response. `append` stays non-retryable -- knowing the id makes the question
-        answerable, it does not make a blind re-submission safe, and that call is
-        the caller's to make.
+        response. That answer is a convenience rather than a precondition for
+        retrying: re-sending the same upload_id replays the server's receipt
+        instead of applying the load a second time, which is what makes a retry
+        safe in every mode. It stops being safe for a caller that re-stages the
+        upload, because a fresh upload id has no receipt to replay.
 
         `partially_succeeded` is terminal and carries a message, so it is raised
         rather than returned -- a caller asked for a table's contents to be

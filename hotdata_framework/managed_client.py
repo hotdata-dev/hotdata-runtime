@@ -162,7 +162,13 @@ class ManagedDatabaseClient:
         # in the background, so it is not the finish line either.
         if isinstance(raw, (QueryResponse, AsyncQueryResponse)):
             return self._await_query_run(raw.query_run_id, database_id=database_id)
-        return None
+        # Returning nothing here would read as an empty table: `fetch_table`
+        # answers `None`, `fetch_table_rows` turns that into `[]`, and a
+        # read-modify-write load would write only its new batch over rows it
+        # believed were not there. A reply shape this client does not know is a
+        # reason to stop, not to report emptiness. `HotdataClient` raises on the
+        # same condition.
+        raise RuntimeError(f"Unexpected query response type: {type(raw)!r}")
 
     def _await_query_run(self, query_run_id: str, *, database_id: str) -> str | None:
         """Wait for a query run to finish; return the result id it produced.

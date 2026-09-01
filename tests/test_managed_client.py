@@ -926,3 +926,44 @@ def test_query_run_model_carries_every_field_this_client_reads() -> None:
     """
     for field in ("status", "result_id", "error_message", "warning_message"):
         assert field in QueryRunInfo.model_fields, field
+
+
+def test_an_unknown_query_reply_shape_raises_rather_than_reading_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last route by which "I do not know" could have read as "no rows".
+
+    If an SDK release adds a third reply model for the query endpoint, neither
+    `isinstance` branch matches. Falling through to `None` would surface as an
+    empty table -- and `fetch_table_rows` maps `None` to `[]`, the same answer it
+    gives for a table that is not synced -- so a merge or append load would drop
+    every row already there. `HotdataClient` raises on this condition; now both
+    do.
+
+    After this, a `None` from `fetch_table` means one thing only: the table is
+    not synced.
+    """
+
+    class FakeQueryApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def query(self, request: object, *, x_database_id: str) -> Any:
+            # A shape from neither branch -- a future reply model, as far as
+            # this client is concerned.
+            return SimpleNamespace(something_new="?")
+
+    monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
+    monkeypatch.setattr(mc.time, "sleep", lambda _seconds: None)
+
+    client = mc.ManagedDatabaseClient(
+        api_key="k",
+        workspace_id="w",
+        api_base_url="https://example.test",
+        max_retries=1,
+        retry_backoff_seconds=0.0,
+    )
+    client._runtime = _fake_runtime()
+
+    with pytest.raises(HotdataTerminalError, match="Unexpected query response type"):
+        client.fetch_table_rows(database="mydb", schema="public", table="orders")

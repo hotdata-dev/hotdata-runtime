@@ -31,9 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table. `fetch_table` answered `None` for it, which `fetch_table_rows` turns
   into `[]`, the same answer both give for a table that is not synced. A
   read-modify-write load would have read no existing rows and written only its
-  new batch, dropping every row already there. Arrow stays the only path the
-  data travels, so column types come from the server's schema rather than being
-  inferred from JSON.
+  new batch, dropping every row already there. A reply shape this client does not
+  recognise raises for the same reason, as `HotdataClient` already did — so a
+  `None` from `fetch_table` now means one thing only: the table is not synced.
+  Arrow stays the only path the data travels, so column types come from the
+  server's schema rather than being inferred from JSON.
 
   Costs one extra round trip on a query that would have answered synchronously,
   in exchange for not transferring the result twice.

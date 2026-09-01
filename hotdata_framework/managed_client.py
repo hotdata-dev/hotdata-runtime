@@ -196,10 +196,14 @@ class ManagedDatabaseClient:
                     # and write only its new batch, dropping what was there.
                     # Terminal rather than transient: re-running the query
                     # cannot save a result that was already discarded.
+                    # `getattr` because this runs while building an error: if
+                    # the field ever goes away, losing the explanation is a far
+                    # better outcome than an AttributeError replacing the raise.
+                    warning = getattr(run, "warning_message", None)
                     raise RuntimeError(
                         f"Query run {query_run_id} succeeded but its result was not "
                         f"saved, so the table cannot be read"
-                        + (f": {run.warning_message}" if run.warning_message else "")
+                        + (f": {warning}" if warning else "")
                     )
                 return run.result_id
             if run.status == "interrupted":

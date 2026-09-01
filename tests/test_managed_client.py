@@ -10,6 +10,7 @@ import pytest
 from hotdata.arrow import ResultNotReadyError
 from hotdata.models.async_query_response import AsyncQueryResponse
 from hotdata.models.query_response import QueryResponse
+from hotdata.models.query_run_info import QueryRunInfo
 from hotdata.rest import ApiException
 
 import hotdata_framework.managed_client as mc
@@ -911,3 +912,17 @@ def test_arrow_fetch_waits_out_a_result_that_is_not_ready_yet(
     assert table is not None
     assert table.num_rows == 2
     assert len(attempts) == 3
+
+
+def test_query_run_model_carries_every_field_this_client_reads() -> None:
+    """Pins the attributes read off a query run against the generated model.
+
+    Every fake in this file is a `SimpleNamespace`, so nothing else here would
+    notice if one of these fields were renamed or dropped by an SDK release --
+    the fakes would keep answering and the tests would keep passing. The cost
+    lands at runtime, and worst on `warning_message`, which is read while
+    building an error: losing it turns a message naming the problem into an
+    `AttributeError` naming nothing.
+    """
+    for field in ("status", "result_id", "error_message", "warning_message"):
+        assert field in QueryRunInfo.model_fields, field

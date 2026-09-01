@@ -245,18 +245,65 @@ def test_list_qualified_table_names_passes_connection_id():
     assert it.call_args.kwargs["connection_id"] == "conn_a"
 
 
-def test_wait_result_ready_raises_on_cancelled():
+def test_wait_result_ready_raises_on_a_failed_result():
     client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
 
     class FakeResultsApi:
         def get_result(self, result_id: str):
-            return SimpleNamespace(status="cancelled", error_message=None)
+            return SimpleNamespace(status="failed", error_message="out of memory")
 
     with (
         patch.object(client, "_results_api", return_value=FakeResultsApi()),
-        pytest.raises(RuntimeError, match="cancelled"),
+        pytest.raises(RuntimeError, match="out of memory"),
     ):
         client._wait_result_ready("res_1", timeout_s=0.1, interval_s=0)
+
+
+def test_unknown_result_status_times_out_and_names_the_status():
+    """An unrecognised status keeps polling rather than being called terminal.
+
+    Failing fast on an unknown status would be easier to debug, and far worse to
+    live with: one status added upstream would fail every read at once, where
+    waiting costs a single slow call. The timeout names what it waited on, which
+    is what makes the omission findable -- and what was missing when
+    `interrupted` went unrecognised.
+    """
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+
+    class FakeResultsApi:
+        def get_result(self, result_id: str):
+            return SimpleNamespace(status="something_new", error_message=None)
+
+    with (
+        patch.object(client, "_results_api", return_value=FakeResultsApi()),
+        pytest.raises(TimeoutError, match="something_new"),
+    ):
+        client._wait_result_ready("res_1", timeout_s=0.05, interval_s=0)
+
+
+def test_poll_query_run_returns_promptly_on_interrupted():
+    """`interrupted` is terminal, so the poll must stop on it.
+
+    It was absent from the terminal set, so an interrupted run was polled for the
+    full timeout and then raised `TimeoutError` -- hiding a retryable condition
+    behind a five-minute wait, behind an error naming the wrong problem.
+    """
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    calls: list[str] = []
+
+    class FakeQueryRunsApi:
+        def get_query_run(self, query_run_id: str):
+            calls.append(query_run_id)
+            return SimpleNamespace(
+                status="interrupted", error_message="instance lost", result_id=None
+            )
+
+    with patch.object(client, "_query_runs_api", return_value=FakeQueryRunsApi()):
+        run = client._poll_query_run("qrun_1", timeout_s=30.0, interval_s=0)
+
+    assert run.status == "interrupted"
+    # One request, not a timeout's worth.
+    assert len(calls) == 1
 
 
 def test_connection_id_by_name_raises_on_duplicate_names():

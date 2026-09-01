@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- fix(managed): wait on the query run instead of downloading the result to check it.
+
+  Reading a managed table made three calls and used one. `POST /v1/query` returned
+  an inline preview of the rows, `GET /v1/results/{id}` was polled until the
+  result was `ready`, and the result was then fetched as Arrow. Only the Arrow
+  copy was used.
+
+  The readiness poll was the expensive one. `limit` on that endpoint defaults to
+  unbounded, so polling a ready result downloads the entire result body to read
+  one status field. It is also the wrong endpoint to lean on as a table grows:
+  a JSON body over the instance's per-fetch memory budget is refused with 413,
+  and one that would fit alone but not alongside concurrent JSON fetches with
+  429 — so the readiness check starts failing on exactly the largest tables.
+
+  The query is now submitted with `async`, so the server returns a run id rather
+  than a preview, and readiness comes from `GET /v1/query-runs/{id}`, which
+  carries no rows at any size. `result_id` is read off the run rather than off
+  the query reply, because a run can succeed having saved nothing and the run is
+  what reports that — and that case now raises rather than reading as an empty
+  table. `fetch_table` answered `None` for it, which `fetch_table_rows` turns
+  into `[]`, the same answer both give for a table that is not synced. A
+  read-modify-write load would have read no existing rows and written only its
+  new batch, dropping every row already there. A reply shape this client does not
+  recognise raises for the same reason, as `HotdataClient` already did — so a
+  `None` from `fetch_table` now means one thing only: the table is not synced.
+  Arrow stays the only path the data travels, so column types come from the
+  server's schema rather than being inferred from JSON.
+
+  Costs one extra round trip on a query that would have answered synchronously,
+  in exchange for not transferring the result twice.
+
+  The Arrow fetch now also waits out a result that reports itself not ready, in
+  case that ordering ever stops holding. It should be unreachable, and it is
+  cheap to keep: that endpoint answers a result which is not ready with a small
+  refusal rather than with data, which is exactly what made waiting on the JSON
+  result body expensive and waiting here not.
+
+- fix(managed): recognise `interrupted`, and drop a run status the API never sends.
+
+  Both `ManagedDatabaseClient` and `HotdataClient` treated `failed` and
+  `cancelled` as the terminal run failures. `cancelled` is not a status this API
+  returns. `interrupted` is — a run whose server was replaced before it finished
+  — and it matched neither, so an interrupted run was polled for the full
+  five-minute timeout and then raised `TimeoutError`: a retryable condition
+  hidden behind a long wait and an error naming the wrong problem.
+
+  On `ManagedDatabaseClient` an interrupted run is now raised as transient, so
+  the surrounding retry re-submits the query. That needed `classify_sdk_error` to
+  pass an already-classified error through unchanged rather than demoting a
+  caller-raised transient error to terminal. `HotdataClient.execute_sql` now
+  fails fast on it with the run's own message.
+
+  Both polls keep enumerating the statuses that mean *finished*, and an
+  unrecognised status still waits. Calling an unknown status terminal would make
+  the omission easier to diagnose and much worse to live with: one status added
+  upstream would fail every read at once, where waiting costs a single slow call.
+  What made `interrupted` expensive was not the waiting — it was that the
+  timeout never said which status it had been waiting on. Both timeouts now name
+  it.
+
 ## [0.13.0] - 2026-08-27
 
 ### Fixed

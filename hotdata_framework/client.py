@@ -77,8 +77,17 @@ VectorMetric = Literal["l2", "cosine", "dot"]
 _INDEX_TYPES = frozenset(get_args(IndexType))
 _VECTOR_METRICS = frozenset(get_args(VectorMetric))
 
-_TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
-_RESULT_FAILURE = frozenset({"failed", "cancelled"})
+# Query-run statuses that mean the run is over. `interrupted` belongs here --
+# omitting it is what made an interrupted run wait out the full timeout -- and
+# `cancelled`, listed here for a long time, is not a status this API sends.
+#
+# Enumerating the terminal side rather than the in-flight side is deliberate. An
+# unrecognised status then keeps polling and costs one slow call, where treating
+# it as terminal would fail every query the moment a status is added upstream.
+# The timeout names the status it last saw, so a missing one is diagnosable
+# without being dangerous.
+_RUN_TERMINAL = frozenset({"succeeded", "failed", "interrupted"})
+_RESULT_FAILURE = frozenset({"failed"})
 # Jobs have no "cancelled" state; "partially_succeeded" carries an error_message.
 _JOB_TERMINAL = frozenset({"succeeded", "partially_succeeded", "failed"})
 
@@ -918,7 +927,7 @@ class HotdataClient:
         last = None
         while time.monotonic() < deadline:
             last = runs.get_query_run(query_run_id)
-            if last.status in _TERMINAL:
+            if last.status in _RUN_TERMINAL:
                 return last
             time.sleep(interval_s)
         raise TimeoutError(

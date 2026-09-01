@@ -77,8 +77,15 @@ VectorMetric = Literal["l2", "cosine", "dot"]
 _INDEX_TYPES = frozenset(get_args(IndexType))
 _VECTOR_METRICS = frozenset(get_args(VectorMetric))
 
-_TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
-_RESULT_FAILURE = frozenset({"failed", "cancelled"})
+# Enumerate the in-flight statuses, not the terminal ones. A poll that lists
+# what is terminal treats anything it does not recognise as "keep waiting", so a
+# status the API adds later -- or one that was simply missed -- costs the full
+# timeout before surfacing. Listing what is still in flight makes an unknown
+# status raise on the first pass, naming itself. `interrupted` was missed by
+# exactly the other arrangement, and `cancelled` was listed here without being a
+# status this API sends.
+_RUN_IN_FLIGHT = frozenset({"running"})
+_RESULT_IN_FLIGHT = frozenset({"pending", "processing"})
 # Jobs have no "cancelled" state; "partially_succeeded" carries an error_message.
 _JOB_TERMINAL = frozenset({"succeeded", "partially_succeeded", "failed"})
 
@@ -918,7 +925,7 @@ class HotdataClient:
         last = None
         while time.monotonic() < deadline:
             last = runs.get_query_run(query_run_id)
-            if last.status in _TERMINAL:
+            if last.status not in _RUN_IN_FLIGHT:
                 return last
             time.sleep(interval_s)
         raise TimeoutError(
@@ -1027,7 +1034,7 @@ class HotdataClient:
             last = results.get_result(result_id)
             if last.status == "ready":
                 return last
-            if last.status in _RESULT_FAILURE:
+            if last.status not in _RESULT_IN_FLIGHT:
                 raise RuntimeError(last.error_message or f"Result {last.status}")
             time.sleep(interval_s)
         raise TimeoutError(

@@ -35,16 +35,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - fix(managed): recognise `interrupted`, and drop a run status the API never sends.
 
-  The query-run poll treated `failed` and `cancelled` as the terminal failures.
-  `cancelled` is not a status this API returns. `interrupted` is — a run whose
-  server was replaced before it finished — and it matched neither branch, so the
-  poll ran to its five-minute timeout and raised `TimeoutError` instead of
-  failing fast.
+  Both `ManagedDatabaseClient` and `HotdataClient` treated `failed` and
+  `cancelled` as the terminal run failures. `cancelled` is not a status this API
+  returns. `interrupted` is — a run whose server was replaced before it finished
+  — and it matched neither, so an interrupted run was polled for the full
+  five-minute timeout and then raised `TimeoutError`: a retryable condition
+  hidden behind a long wait and an error naming the wrong problem.
 
-  An interrupted run is safe to re-run, so it is now raised as transient and the
-  surrounding retry re-submits the query. `classify_sdk_error` passes an
-  already-classified error through unchanged, rather than demoting a
-  caller-raised transient error to terminal.
+  On `ManagedDatabaseClient` an interrupted run is now raised as transient, so
+  the surrounding retry re-submits the query. That needed `classify_sdk_error` to
+  pass an already-classified error through unchanged rather than demoting a
+  caller-raised transient error to terminal. `HotdataClient.execute_sql` now
+  fails fast on it with the run's own message.
+
+  Both polls now enumerate the statuses that mean *still in flight* rather than
+  the ones that mean *finished*, for query runs and for results alike. Listing
+  the terminal side treats an unrecognised status as "keep waiting", which is
+  precisely how `interrupted` came to be waited out; listing the in-flight side
+  makes the next status the API adds fail on the first pass, naming itself.
 
 ## [0.13.0] - 2026-08-27
 

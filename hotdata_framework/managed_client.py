@@ -40,6 +40,11 @@ class ManagedDatabaseClient:
     database lifecycle.
     """
 
+    # The only status a query run reports while still in flight. Listed this way
+    # round so an unknown status raises immediately rather than being polled to
+    # the timeout; see `_await_query_run`.
+    _RUN_IN_FLIGHT = frozenset({"running"})
+
     _QUERY_TIMEOUT_SECONDS = 300.0
     _POLL_INTERVAL_SECONDS = 0.4
     _MAX_BACKOFF_SECONDS = 30.0
@@ -178,8 +183,12 @@ class ManagedDatabaseClient:
                 raise HotdataTransientError(
                     run.error_message or f"Query run {query_run_id} was interrupted"
                 )
-            if run.status == "failed":
-                raise RuntimeError(run.error_message or f"Query run {query_run_id} failed")
+            # Anything not still in flight is terminal, whether or not this
+            # client has heard of it. Enumerating the terminal statuses instead
+            # would poll an unrecognised one to the timeout -- which is exactly
+            # how `interrupted` came to be waited out for five minutes.
+            if run.status not in self._RUN_IN_FLIGHT:
+                raise RuntimeError(run.error_message or f"Query run {query_run_id} {run.status}")
             time.sleep(self._POLL_INTERVAL_SECONDS)
         raise TimeoutError(
             f"Query run {query_run_id} did not finish within {self._QUERY_TIMEOUT_SECONDS}s"

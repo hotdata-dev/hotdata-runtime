@@ -673,7 +673,12 @@ def test_query_is_submitted_async_so_no_preview_is_built(
 
     assert table is not None
     assert len(requests) == 1
-    assert requests[0].var_async is True
+    # The attribute alone is not the contract: the field only reaches the server
+    # as `async`. Were the alias missing or misspelled, the attribute assertion
+    # would still pass, the server would ignore the field and answer
+    # synchronously with a full preview -- restoring the exact behaviour this
+    # change removes, silently.
+    assert requests[0].to_dict()["async"] is True
 
 
 def test_async_reply_is_followed_through_to_arrow(
@@ -742,3 +747,49 @@ def test_async_reply_is_followed_through_to_arrow(
         "get_query_run:succeeded",
         "arrow:rslt-from-run",
     ]
+
+
+def test_unknown_run_status_fails_fast_instead_of_polling_to_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only `running` means "still in flight"; anything else is terminal.
+
+    Enumerating the terminal statuses is what let `interrupted` be polled for
+    five minutes, so the test runs the other way round: a status this client has
+    never seen raises on the first pass and names itself.
+    """
+    calls: list[str] = []
+
+    class FakeQueryApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def query(self, request: object, *, x_database_id: str) -> AsyncQueryResponse:
+            return _async_query_response()
+
+    class FakeQueryRunsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_query_run(self, query_run_id: str, **kwargs: Any) -> Any:
+            calls.append("get_query_run")
+            return SimpleNamespace(status="evicted", result_id=None, error_message=None)
+
+    monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
+    monkeypatch.setattr(mc, "QueryRunsApi", FakeQueryRunsApi)
+    monkeypatch.setattr(mc.time, "sleep", lambda _seconds: None)
+
+    client = mc.ManagedDatabaseClient(
+        api_key="k",
+        workspace_id="w",
+        api_base_url="https://example.test",
+        max_retries=1,
+        retry_backoff_seconds=0.0,
+    )
+    client._runtime = _fake_runtime()
+
+    with pytest.raises(HotdataTerminalError, match="evicted"):
+        client.fetch_table(database="mydb", schema="public", table="orders")
+
+    # One poll, not a timeout's worth.
+    assert len(calls) == 1

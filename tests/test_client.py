@@ -245,18 +245,50 @@ def test_list_qualified_table_names_passes_connection_id():
     assert it.call_args.kwargs["connection_id"] == "conn_a"
 
 
-def test_wait_result_ready_raises_on_cancelled():
+def test_wait_result_ready_raises_on_any_status_that_is_not_in_flight():
+    """A result neither `ready` nor still being saved is terminal.
+
+    The poll enumerates the in-flight statuses rather than the terminal ones, so
+    a status this client has never heard of raises on the first pass instead of
+    being waited out. `cancelled` -- which this poll listed as terminal, and
+    which the API does not send -- is as good a stand-in as any.
+    """
     client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
 
     class FakeResultsApi:
         def get_result(self, result_id: str):
-            return SimpleNamespace(status="cancelled", error_message=None)
+            return SimpleNamespace(status="something_new", error_message=None)
 
     with (
         patch.object(client, "_results_api", return_value=FakeResultsApi()),
-        pytest.raises(RuntimeError, match="cancelled"),
+        pytest.raises(RuntimeError, match="something_new"),
     ):
         client._wait_result_ready("res_1", timeout_s=0.1, interval_s=0)
+
+
+def test_poll_query_run_returns_promptly_on_interrupted():
+    """`interrupted` is terminal, so the poll must stop on it.
+
+    It was absent from the terminal set, so an interrupted run was polled for the
+    full timeout and then raised `TimeoutError` -- hiding a retryable condition
+    behind a five-minute wait, behind an error naming the wrong problem.
+    """
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
+    calls: list[str] = []
+
+    class FakeQueryRunsApi:
+        def get_query_run(self, query_run_id: str):
+            calls.append(query_run_id)
+            return SimpleNamespace(
+                status="interrupted", error_message="instance lost", result_id=None
+            )
+
+    with patch.object(client, "_query_runs_api", return_value=FakeQueryRunsApi()):
+        run = client._poll_query_run("qrun_1", timeout_s=30.0, interval_s=0)
+
+    assert run.status == "interrupted"
+    # One request, not a timeout's worth.
+    assert len(calls) == 1
 
 
 def test_connection_id_by_name_raises_on_duplicate_names():

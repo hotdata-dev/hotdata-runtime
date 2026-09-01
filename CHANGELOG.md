@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Costs one extra round trip on a query that would have answered synchronously,
   in exchange for not transferring the result twice.
 
+  The Arrow fetch now also waits out a result that reports itself not ready, in
+  case that ordering ever stops holding. It should be unreachable, and it is
+  cheap to keep: that endpoint answers a result which is not ready with a small
+  refusal rather than with data, which is exactly what made waiting on the JSON
+  result body expensive and waiting here not.
+
 - fix(managed): recognise `interrupted`, and drop a run status the API never sends.
 
   Both `ManagedDatabaseClient` and `HotdataClient` treated `failed` and
@@ -48,11 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller-raised transient error to terminal. `HotdataClient.execute_sql` now
   fails fast on it with the run's own message.
 
-  Both polls now enumerate the statuses that mean *still in flight* rather than
-  the ones that mean *finished*, for query runs and for results alike. Listing
-  the terminal side treats an unrecognised status as "keep waiting", which is
-  precisely how `interrupted` came to be waited out; listing the in-flight side
-  makes the next status the API adds fail on the first pass, naming itself.
+  Both polls keep enumerating the statuses that mean *finished*, and an
+  unrecognised status still waits. Calling an unknown status terminal would make
+  the omission easier to diagnose and much worse to live with: one status added
+  upstream would fail every read at once, where waiting costs a single slow call.
+  What made `interrupted` expensive was not the waiting — it was that the
+  timeout never said which status it had been waiting on. Both timeouts now name
+  it.
 
 ## [0.13.0] - 2026-08-27
 

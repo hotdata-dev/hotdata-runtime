@@ -245,13 +245,28 @@ def test_list_qualified_table_names_passes_connection_id():
     assert it.call_args.kwargs["connection_id"] == "conn_a"
 
 
-def test_wait_result_ready_raises_on_any_status_that_is_not_in_flight():
-    """A result neither `ready` nor still being saved is terminal.
+def test_wait_result_ready_raises_on_a_failed_result():
+    client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
 
-    The poll enumerates the in-flight statuses rather than the terminal ones, so
-    a status this client has never heard of raises on the first pass instead of
-    being waited out. `cancelled` -- which this poll listed as terminal, and
-    which the API does not send -- is as good a stand-in as any.
+    class FakeResultsApi:
+        def get_result(self, result_id: str):
+            return SimpleNamespace(status="failed", error_message="out of memory")
+
+    with (
+        patch.object(client, "_results_api", return_value=FakeResultsApi()),
+        pytest.raises(RuntimeError, match="out of memory"),
+    ):
+        client._wait_result_ready("res_1", timeout_s=0.1, interval_s=0)
+
+
+def test_unknown_result_status_times_out_and_names_the_status():
+    """An unrecognised status keeps polling rather than being called terminal.
+
+    Failing fast on an unknown status would be easier to debug, and far worse to
+    live with: one status added upstream would fail every read at once, where
+    waiting costs a single slow call. The timeout names what it waited on, which
+    is what makes the omission findable -- and what was missing when
+    `interrupted` went unrecognised.
     """
     client = HotdataClient("k", "ws", host="https://api.hotdata.dev")
 
@@ -261,9 +276,9 @@ def test_wait_result_ready_raises_on_any_status_that_is_not_in_flight():
 
     with (
         patch.object(client, "_results_api", return_value=FakeResultsApi()),
-        pytest.raises(RuntimeError, match="something_new"),
+        pytest.raises(TimeoutError, match="something_new"),
     ):
-        client._wait_result_ready("res_1", timeout_s=0.1, interval_s=0)
+        client._wait_result_ready("res_1", timeout_s=0.05, interval_s=0)
 
 
 def test_poll_query_run_returns_promptly_on_interrupted():

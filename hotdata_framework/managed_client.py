@@ -15,6 +15,7 @@ from typing import Any, TypeVar
 import pyarrow as pa
 from hotdata.api.query_api import QueryApi
 from hotdata.api.query_runs_api import QueryRunsApi
+from hotdata.arrow import ResultNotReadyError
 from hotdata.arrow import ResultsApi as ArrowResultsApi
 from hotdata.models.async_query_response import AsyncQueryResponse
 from hotdata.models.query_request import QueryRequest
@@ -39,11 +40,6 @@ class ManagedDatabaseClient:
     Arrow-based result fetching, and convenience helpers for the managed
     database lifecycle.
     """
-
-    # The only status a query run reports while still in flight. Listed this way
-    # round so an unknown status raises immediately rather than being polled to
-    # the timeout; see `_await_query_run`.
-    _RUN_IN_FLIGHT = frozenset({"running"})
 
     _QUERY_TIMEOUT_SECONDS = 300.0
     _POLL_INTERVAL_SECONDS = 0.4
@@ -124,9 +120,22 @@ class ManagedDatabaseClient:
         0.6.0 SDK exposes (and requires) ``x_database_id`` on the Arrow
         helper directly.
         """
-        return ArrowResultsApi(self._runtime.api).get_result_arrow(
-            result_id, x_database_id=database_id
-        )
+        arrow = ArrowResultsApi(self._runtime.api)
+        deadline = time.monotonic() + self._QUERY_TIMEOUT_SECONDS
+        while True:
+            try:
+                return arrow.get_result_arrow(result_id, x_database_id=database_id)
+            except ResultNotReadyError:
+                # Waiting on the run should already have made this unreachable:
+                # a run reports `succeeded` only once its result is saved and
+                # ready. Tolerating it anyway costs nothing and removes the need
+                # to take that ordering on trust. The Arrow endpoint answers a
+                # result that is not ready with a small refusal rather than with
+                # data, so waiting here is cheap in the way waiting on the JSON
+                # result body -- which is what this change removed -- is not.
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(self._POLL_INTERVAL_SECONDS)
 
     def _query_database_scoped(self, sql: str, *, database_id: str) -> str | None:
         raw = QueryApi(self._runtime.api).query(
@@ -170,9 +179,11 @@ class ManagedDatabaseClient:
         """
         runs = QueryRunsApi(self._runtime.api)
         deadline = time.monotonic() + self._QUERY_TIMEOUT_SECONDS
+        last_status: str | None = None
         while time.monotonic() < deadline:
             # Runs (like results) of database-scoped queries are database-scoped.
             run = runs.get_query_run(query_run_id, x_database_id=database_id)
+            last_status = run.status
             if run.status == "succeeded":
                 return run.result_id
             if run.status == "interrupted":
@@ -183,15 +194,19 @@ class ManagedDatabaseClient:
                 raise HotdataTransientError(
                     run.error_message or f"Query run {query_run_id} was interrupted"
                 )
-            # Anything not still in flight is terminal, whether or not this
-            # client has heard of it. Enumerating the terminal statuses instead
-            # would poll an unrecognised one to the timeout -- which is exactly
-            # how `interrupted` came to be waited out for five minutes.
-            if run.status not in self._RUN_IN_FLIGHT:
-                raise RuntimeError(run.error_message or f"Query run {query_run_id} {run.status}")
+            if run.status == "failed":
+                raise RuntimeError(run.error_message or f"Query run {query_run_id} failed")
+            # Any other status keeps polling, including one this client has never
+            # seen. Treating an unrecognised status as terminal is the cheaper
+            # failure to diagnose and by far the more expensive one to suffer: a
+            # single status added upstream would then fail every query at once,
+            # where waiting costs one slow call. What made `interrupted`
+            # expensive was not the waiting, it was that the timeout never said
+            # which status it had waited on -- so the message now carries it.
             time.sleep(self._POLL_INTERVAL_SECONDS)
         raise TimeoutError(
-            f"Query run {query_run_id} did not finish within {self._QUERY_TIMEOUT_SECONDS}s"
+            f"Query run {query_run_id} did not finish within "
+            f"{self._QUERY_TIMEOUT_SECONDS}s (last status: {last_status})"
         )
 
     def fetch_table_rows(self, *, database: str, schema: str, table: str) -> list[dict[str, Any]]:

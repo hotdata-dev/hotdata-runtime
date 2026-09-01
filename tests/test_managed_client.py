@@ -7,12 +7,13 @@ from typing import Any
 
 import pyarrow as pa
 import pytest
+from hotdata.arrow import ResultNotReadyError
 from hotdata.models.async_query_response import AsyncQueryResponse
 from hotdata.models.query_response import QueryResponse
 from hotdata.rest import ApiException
 
 import hotdata_framework.managed_client as mc
-from hotdata_framework.errors import HotdataTerminalError
+from hotdata_framework.errors import HotdataTerminalError, HotdataTransientError
 
 
 def _query_response(result_id: str) -> QueryResponse:
@@ -749,16 +750,19 @@ def test_async_reply_is_followed_through_to_arrow(
     ]
 
 
-def test_unknown_run_status_fails_fast_instead_of_polling_to_the_timeout(
+def test_unknown_run_status_keeps_polling_and_the_timeout_names_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only `running` means "still in flight"; anything else is terminal.
+    """An unrecognised run status waits rather than being called terminal.
 
-    Enumerating the terminal statuses is what let `interrupted` be polled for
-    five minutes, so the test runs the other way round: a status this client has
-    never seen raises on the first pass and names itself.
+    Treating an unknown status as terminal is the cheaper failure to diagnose
+    and much the more expensive one to suffer: a single status added upstream
+    would fail every read at once, where waiting costs one slow call. So the
+    poll enumerates what it knows is terminal, and the timeout carries the
+    status it last saw -- which is precisely what was missing while
+    `interrupted` went unrecognised, and what would have made that a one-line
+    diagnosis instead of a mystery.
     """
-    calls: list[str] = []
 
     class FakeQueryApi:
         def __init__(self, api: object) -> None:
@@ -772,7 +776,6 @@ def test_unknown_run_status_fails_fast_instead_of_polling_to_the_timeout(
             pass
 
         def get_query_run(self, query_run_id: str, **kwargs: Any) -> Any:
-            calls.append("get_query_run")
             return SimpleNamespace(status="evicted", result_id=None, error_message=None)
 
     monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
@@ -787,9 +790,67 @@ def test_unknown_run_status_fails_fast_instead_of_polling_to_the_timeout(
         retry_backoff_seconds=0.0,
     )
     client._runtime = _fake_runtime()
+    monkeypatch.setattr(client, "_QUERY_TIMEOUT_SECONDS", 0.05)
 
-    with pytest.raises(HotdataTerminalError, match="evicted"):
+    # TimeoutError classifies as transient, so the retry wrapper re-raises it
+    # as such once the budget is spent -- the status still has to reach the text.
+    with pytest.raises(HotdataTransientError, match="evicted"):
         client.fetch_table(database="mydb", schema="public", table="orders")
 
-    # One poll, not a timeout's worth.
-    assert len(calls) == 1
+
+def test_arrow_fetch_waits_out_a_result_that_is_not_ready_yet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Belt and braces over the run wait.
+
+    A run reports `succeeded` only once its result is saved and ready, so this
+    should not happen. Tolerating it costs nothing and removes the need to take
+    that ordering on trust: the Arrow endpoint answers a result that is not ready
+    with a small refusal rather than with data, so waiting here is cheap in the
+    way waiting on the JSON result body is not.
+    """
+    attempts: list[str] = []
+
+    class FakeQueryApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def query(self, request: object, *, x_database_id: str) -> AsyncQueryResponse:
+            return _async_query_response()
+
+    class FakeQueryRunsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_query_run(self, query_run_id: str, **kwargs: Any) -> Any:
+            return SimpleNamespace(status="succeeded", result_id="rslt1", error_message=None)
+
+    class FakeArrowResultsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_result_arrow(self, result_id: str, **kwargs: Any) -> pa.Table:
+            attempts.append(result_id)
+            if len(attempts) < 3:
+                raise ResultNotReadyError(status="processing", result_id=result_id)
+            return pa.table({"id": [1, 2]})
+
+    monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
+    monkeypatch.setattr(mc, "QueryRunsApi", FakeQueryRunsApi)
+    monkeypatch.setattr(mc, "ArrowResultsApi", FakeArrowResultsApi)
+    monkeypatch.setattr(mc.time, "sleep", lambda _seconds: None)
+
+    client = mc.ManagedDatabaseClient(
+        api_key="k",
+        workspace_id="w",
+        api_base_url="https://example.test",
+        max_retries=1,
+        retry_backoff_seconds=0.0,
+    )
+    client._runtime = _fake_runtime()
+
+    table = client.fetch_table(database="mydb", schema="public", table="orders")
+
+    assert table is not None
+    assert table.num_rows == 2
+    assert len(attempts) == 3

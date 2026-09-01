@@ -77,15 +77,17 @@ VectorMetric = Literal["l2", "cosine", "dot"]
 _INDEX_TYPES = frozenset(get_args(IndexType))
 _VECTOR_METRICS = frozenset(get_args(VectorMetric))
 
-# Enumerate the in-flight statuses, not the terminal ones. A poll that lists
-# what is terminal treats anything it does not recognise as "keep waiting", so a
-# status the API adds later -- or one that was simply missed -- costs the full
-# timeout before surfacing. Listing what is still in flight makes an unknown
-# status raise on the first pass, naming itself. `interrupted` was missed by
-# exactly the other arrangement, and `cancelled` was listed here without being a
-# status this API sends.
-_RUN_IN_FLIGHT = frozenset({"running"})
-_RESULT_IN_FLIGHT = frozenset({"pending", "processing"})
+# Query-run statuses that mean the run is over. `interrupted` belongs here --
+# omitting it is what made an interrupted run wait out the full timeout -- and
+# `cancelled`, listed here for a long time, is not a status this API sends.
+#
+# Enumerating the terminal side rather than the in-flight side is deliberate. An
+# unrecognised status then keeps polling and costs one slow call, where treating
+# it as terminal would fail every query the moment a status is added upstream.
+# The timeout names the status it last saw, so a missing one is diagnosable
+# without being dangerous.
+_RUN_TERMINAL = frozenset({"succeeded", "failed", "interrupted"})
+_RESULT_FAILURE = frozenset({"failed"})
 # Jobs have no "cancelled" state; "partially_succeeded" carries an error_message.
 _JOB_TERMINAL = frozenset({"succeeded", "partially_succeeded", "failed"})
 
@@ -925,7 +927,7 @@ class HotdataClient:
         last = None
         while time.monotonic() < deadline:
             last = runs.get_query_run(query_run_id)
-            if last.status not in _RUN_IN_FLIGHT:
+            if last.status in _RUN_TERMINAL:
                 return last
             time.sleep(interval_s)
         raise TimeoutError(
@@ -1034,7 +1036,7 @@ class HotdataClient:
             last = results.get_result(result_id)
             if last.status == "ready":
                 return last
-            if last.status not in _RESULT_IN_FLIGHT:
+            if last.status in _RESULT_FAILURE:
                 raise RuntimeError(last.error_message or f"Result {last.status}")
             time.sleep(interval_s)
         raise TimeoutError(

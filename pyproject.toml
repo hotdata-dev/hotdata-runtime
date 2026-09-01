@@ -37,7 +37,7 @@ dependencies = [
   # uncapped floor turns someone else's release into a break in ours,
   # with no commit of our own to point at. Raise the cap deliberately, after
   # running the suite against the new minor.
-  "hotdata>=0.9.0,<0.10",
+  "hotdata>=0.9.0,<0.11",
   "pandas>=2.0",
   "pyarrow>=14.0",
 ]

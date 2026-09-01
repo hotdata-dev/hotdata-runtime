@@ -302,15 +302,21 @@ def test_failed_query_run_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> Non
     assert calls.count("query") == 1
 
 
-def test_result_id_is_read_off_the_run_not_the_query_reply(
+def test_a_succeeded_run_that_saved_no_result_raises_rather_than_reading_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A ``succeeded`` run reports ``result_id: null`` when every row came back
-    inline but the result could not be saved for later retrieval.
+    """The one state where an empty answer would be a wrong answer.
 
-    The query reply's own ``result_id`` is optimistic -- it names a result that
-    may never resolve -- so the run's is the one to believe. Believing the reply
-    means fetching Arrow against an id the server will 404.
+    A run succeeds with no `result_id` when its rows came back inline but the
+    result could not be saved. Answering `None` puts that on the same footing as
+    a table that does not exist -- `fetch_table_rows` turns both into `[]` -- so
+    a read-modify-write load would read no existing rows and write only its new
+    batch, dropping the rows already in the table. Silent data loss is the worst
+    outcome available here, so this raises, and raises terminally: re-running
+    cannot save a result that was already discarded.
+
+    The query reply carries an id of its own, and it must not be believed over
+    the run's.
     """
     arrow_calls: list[str] = []
 
@@ -328,7 +334,12 @@ def test_result_id_is_read_off_the_run_not_the_query_reply(
 
         def get_query_run(self, query_run_id: str, **kwargs: Any) -> Any:
             # ...that the run says was never saved.
-            return SimpleNamespace(status="succeeded", result_id=None, error_message=None)
+            return SimpleNamespace(
+                status="succeeded",
+                result_id=None,
+                error_message=None,
+                warning_message="result row creation failed; result not persisted",
+            )
 
     class FakeArrowResultsApi:
         def __init__(self, api: object) -> None:
@@ -341,6 +352,52 @@ def test_result_id_is_read_off_the_run_not_the_query_reply(
     monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
     monkeypatch.setattr(mc, "QueryRunsApi", FakeQueryRunsApi)
     monkeypatch.setattr(mc, "ArrowResultsApi", FakeArrowResultsApi)
+    monkeypatch.setattr(mc.time, "sleep", lambda _seconds: None)
+
+    client = mc.ManagedDatabaseClient(
+        api_key="k",
+        workspace_id="w",
+        api_base_url="https://example.test",
+        max_retries=3,
+        retry_backoff_seconds=0.0,
+    )
+    client._runtime = _fake_runtime()
+
+    with pytest.raises(HotdataTerminalError, match="result was not saved"):
+        client.fetch_table(database="mydb", schema="public", table="orders")
+
+    # The reply's id was never used.
+    assert arrow_calls == []
+
+
+def test_fetch_table_rows_cannot_turn_an_unsaved_result_into_no_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`fetch_table_rows` is where an empty answer does the damage.
+
+    It maps `None` to `[]`, which is also its answer for a table that is not
+    synced, so the unsaved-result case must not be able to reach that mapping.
+    """
+
+    class FakeQueryApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def query(self, request: object, *, x_database_id: str) -> QueryResponse:
+            return _query_response("rslt1")
+
+    class FakeQueryRunsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_query_run(self, query_run_id: str, **kwargs: Any) -> Any:
+            return SimpleNamespace(
+                status="succeeded", result_id=None, error_message=None, warning_message=None
+            )
+
+    monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
+    monkeypatch.setattr(mc, "QueryRunsApi", FakeQueryRunsApi)
+    monkeypatch.setattr(mc.time, "sleep", lambda _seconds: None)
 
     client = mc.ManagedDatabaseClient(
         api_key="k",
@@ -351,8 +408,8 @@ def test_result_id_is_read_off_the_run_not_the_query_reply(
     )
     client._runtime = _fake_runtime()
 
-    assert client.fetch_table(database="mydb", schema="public", table="orders") is None
-    assert arrow_calls == []
+    with pytest.raises(HotdataTerminalError):
+        client.fetch_table_rows(database="mydb", schema="public", table="orders")
 
 
 def _load_recording_runtime(calls: list[str], uploads: list[str] | None = None) -> SimpleNamespace:

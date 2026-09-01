@@ -185,6 +185,22 @@ class ManagedDatabaseClient:
             run = runs.get_query_run(query_run_id, x_database_id=database_id)
             last_status = run.status
             if run.status == "succeeded":
+                if run.result_id is None:
+                    # A run succeeds with no result id when its rows were
+                    # returned inline but the result could not be saved for
+                    # later retrieval. Returning nothing here would surface as
+                    # an empty table -- `fetch_table` answers `None`, and
+                    # `fetch_table_rows` turns that into `[]`, which is the same
+                    # answer it gives for a table that does not exist. A
+                    # read-modify-write load would then read no existing rows
+                    # and write only its new batch, dropping what was there.
+                    # Terminal rather than transient: re-running the query
+                    # cannot save a result that was already discarded.
+                    raise RuntimeError(
+                        f"Query run {query_run_id} succeeded but its result was not "
+                        f"saved, so the table cannot be read"
+                        + (f": {run.warning_message}" if run.warning_message else "")
+                    )
                 return run.result_id
             if run.status == "interrupted":
                 # Terminal, but the server lost the run rather than rejecting

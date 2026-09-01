@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- fix(managed): wait on the query run instead of downloading the result to check it.
+
+  Reading a managed table made three calls and used one. `POST /v1/query` returned
+  an inline preview of the rows, `GET /v1/results/{id}` was polled until the
+  result was `ready`, and the result was then fetched as Arrow. Only the Arrow
+  copy was used.
+
+  The readiness poll was the expensive one. `limit` on that endpoint defaults to
+  unbounded, so polling a ready result downloads the entire result body to read
+  one status field. It is also the wrong endpoint to lean on as a table grows:
+  a JSON body over the instance's per-fetch memory budget is refused with 413,
+  and one that would fit alone but not alongside concurrent JSON fetches with
+  429 — so the readiness check starts failing on exactly the largest tables.
+
+  The query is now submitted with `async`, so the server returns a run id rather
+  than a preview, and readiness comes from `GET /v1/query-runs/{id}`, which
+  carries no rows at any size. `result_id` is read off the run rather than off
+  the query reply, because a run can succeed having saved nothing and the run is
+  what reports that. Arrow stays the only path the data travels, so column types
+  come from the server's schema rather than being inferred from JSON.
+
+  Costs one extra round trip on a query that would have answered synchronously,
+  in exchange for not transferring the result twice.
+
+- fix(managed): recognise `interrupted`, and drop a run status the API never sends.
+
+  The query-run poll treated `failed` and `cancelled` as the terminal failures.
+  `cancelled` is not a status this API returns. `interrupted` is — a run whose
+  server was replaced before it finished — and it matched neither branch, so the
+  poll ran to its five-minute timeout and raised `TimeoutError` instead of
+  failing fast.
+
+  An interrupted run is safe to re-run, so it is now raised as transient and the
+  surrounding retry re-submits the query. `classify_sdk_error` passes an
+  already-classified error through unchanged, rather than demoting a
+  caller-raised transient error to terminal.
+
 ## [0.13.0] - 2026-08-27
 
 ### Fixed

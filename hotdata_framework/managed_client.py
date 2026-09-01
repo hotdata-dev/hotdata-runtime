@@ -10,12 +10,11 @@ from __future__ import annotations
 import random
 import time
 from collections.abc import Callable
-from typing import Any, Protocol, TypeVar
+from typing import Any, TypeVar
 
 import pyarrow as pa
 from hotdata.api.query_api import QueryApi
 from hotdata.api.query_runs_api import QueryRunsApi
-from hotdata.api.results_api import ResultsApi
 from hotdata.arrow import ResultsApi as ArrowResultsApi
 from hotdata.models.async_query_response import AsyncQueryResponse
 from hotdata.models.query_request import QueryRequest
@@ -30,16 +29,6 @@ from hotdata_framework.errors import (
 )
 
 T = TypeVar("T")
-
-
-class _StatusResponse(Protocol):
-    """Async resources (query runs, results) expose a status and error message."""
-
-    status: str
-    error_message: str | None
-
-
-S = TypeVar("S", bound=_StatusResponse)
 
 
 class ManagedDatabaseClient:
@@ -134,66 +123,67 @@ class ManagedDatabaseClient:
             result_id, x_database_id=database_id
         )
 
-    def _poll(
-        self,
-        fetch: Callable[[], S],
-        *,
-        is_ready: Callable[[S], bool],
-        describe: str,
-    ) -> S:
-        """Poll ``fetch`` until ``is_ready`` is satisfied, or raise on failure/timeout.
-
-        ``failed``/``cancelled`` statuses raise ``RuntimeError``; exceeding
-        :attr:`_QUERY_TIMEOUT_SECONDS` raises ``TimeoutError``.
-        """
-        deadline = time.monotonic() + self._QUERY_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            obj = fetch()
-            if obj.status in ("failed", "cancelled"):
-                raise RuntimeError(obj.error_message or f"{describe} {obj.status}")
-            if is_ready(obj):
-                return obj
-            time.sleep(self._POLL_INTERVAL_SECONDS)
-        raise TimeoutError(f"{describe} timed out after {self._QUERY_TIMEOUT_SECONDS}s")
-
     def _query_database_scoped(self, sql: str, *, database_id: str) -> str | None:
         raw = QueryApi(self._runtime.api).query(
-            QueryRequest(sql=sql),
+            # Asked asynchronously because this caller wants a result id, not
+            # rows. A synchronous submit always builds an inline preview of the
+            # result and sends it -- megabytes, on a path that then reads the
+            # whole result as Arrow anyway and never looks at the preview. The
+            # async reply carries a run id and nothing else, and there is no way
+            # to suppress the preview on a synchronous one.
+            #
+            # It also settles the types: the preview is JSON, which has no Arrow
+            # schema and renders non-finite floats as null, so it could not have
+            # substituted for the Arrow fetch even when it holds every row.
+            #
+            # `var_async` is the generated SDK's spelling of the wire field
+            # `async`, which is a Python keyword and so cannot be the attribute
+            # name.
+            QueryRequest(sql=sql, var_async=True),
             x_database_id=database_id,
         )
-        if isinstance(raw, QueryResponse):
-            # A synchronous response still persists its full result out-of-band
-            # under ``result_id``; that result may be ``processing`` when the
-            # inline preview returns, so wait for ``ready`` before the caller
-            # fetches it as Arrow.
-            return self._wait_result_ready(raw.result_id, database_id=database_id)
-        if isinstance(raw, AsyncQueryResponse):
-            run_result = self._await_query_run(raw.query_run_id, database_id=database_id)
-            return self._wait_result_ready(run_result, database_id=database_id)
+        # Both reply shapes carry `query_run_id`, and the run is the readiness
+        # signal for either -- a synchronous reply (which `async_after_ms` can
+        # still produce) returns rows inline but goes on saving the full result
+        # in the background, so it is not the finish line either.
+        if isinstance(raw, (QueryResponse, AsyncQueryResponse)):
+            return self._await_query_run(raw.query_run_id, database_id=database_id)
         return None
 
     def _await_query_run(self, query_run_id: str, *, database_id: str) -> str | None:
-        runs = QueryRunsApi(self._runtime.api)
-        run = self._poll(
-            # Runs (like results) of database-scoped queries are database-scoped.
-            lambda: runs.get_query_run(query_run_id, x_database_id=database_id),
-            is_ready=lambda r: r.status == "succeeded",
-            describe="Query",
-        )
-        return run.result_id
+        """Wait for a query run to finish; return the result id it produced.
 
-    def _wait_result_ready(self, result_id: str | None, *, database_id: str) -> str | None:
-        if result_id is None:
-            return None
-        results = ResultsApi(self._runtime.api)
-        self._poll(
-            # The stored result of a database-scoped query 400s without the
-            # database scope.
-            lambda: results.get_result(result_id, x_database_id=database_id),
-            is_ready=lambda r: r.status == "ready",
-            describe=f"Result {result_id}",
+        The run is the whole wait. A run turns `succeeded` only after its result
+        has been saved and is `ready`, so `succeeded` needs no second check
+        against the result -- and asking the result endpoint instead would mean
+        downloading the entire result to read one field, which the server
+        refuses outright (413/429) once the result is large enough.
+
+        `result_id` comes off the run rather than off the query reply because a
+        `succeeded` run reports none when every row came back inline but the
+        result could not be saved for later retrieval.
+        """
+        runs = QueryRunsApi(self._runtime.api)
+        deadline = time.monotonic() + self._QUERY_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            # Runs (like results) of database-scoped queries are database-scoped.
+            run = runs.get_query_run(query_run_id, x_database_id=database_id)
+            if run.status == "succeeded":
+                return run.result_id
+            if run.status == "interrupted":
+                # Terminal, but the server lost the run rather than rejecting
+                # the query, so it is the one failure here worth re-running.
+                # Raised pre-classified: `classify_sdk_error` cannot tell this
+                # apart from an ordinary RuntimeError and would call it terminal.
+                raise HotdataTransientError(
+                    run.error_message or f"Query run {query_run_id} was interrupted"
+                )
+            if run.status == "failed":
+                raise RuntimeError(run.error_message or f"Query run {query_run_id} failed")
+            time.sleep(self._POLL_INTERVAL_SECONDS)
+        raise TimeoutError(
+            f"Query run {query_run_id} did not finish within {self._QUERY_TIMEOUT_SECONDS}s"
         )
-        return result_id
 
     def fetch_table_rows(self, *, database: str, schema: str, table: str) -> list[dict[str, Any]]:
         result = self.fetch_table(database=database, schema=schema, table=table)

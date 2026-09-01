@@ -112,6 +112,12 @@ def _error_class(status_code: int, code: str | None) -> type[HotdataError]:
 
 
 def classify_sdk_error(error: Exception) -> HotdataError:
+    if isinstance(error, HotdataError):
+        # Already classified. A caller that read transience off a typed status
+        # -- an interrupted query run, say -- knows more than this function can
+        # recover from the exception, and the fallback below would demote it to
+        # terminal and cost the retry.
+        return error
     if isinstance(error, TimeoutError):
         return HotdataTransientError(str(error))
     if isinstance(error, ConnectionError):

@@ -7,6 +7,7 @@ from typing import Any
 
 import pyarrow as pa
 import pytest
+from hotdata.models.async_query_response import AsyncQueryResponse
 from hotdata.models.query_response import QueryResponse
 from hotdata.rest import ApiException
 
@@ -28,13 +29,29 @@ def _query_response(result_id: str) -> QueryResponse:
     )
 
 
-def test_fetch_table_waits_for_ready_before_arrow(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A synchronous ``QueryResponse`` persists its full result out-of-band, and
-    that result can still be ``processing`` when the inline preview returns.
+def _async_query_response() -> AsyncQueryResponse:
+    return AsyncQueryResponse(
+        query_run_id="qr",
+        status="running",
+        status_url="/v1/query-runs/qr",
+    )
 
-    ``fetch_table`` must poll the result to ``ready`` before fetching it as
-    Arrow. The earlier bug returned the ``result_id`` immediately on the sync
-    path, so Arrow was fetched against a ``processing`` result and failed.
+
+def test_fetch_table_waits_on_the_query_run_not_the_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Readiness is the query run's answer to give, not the result endpoint's.
+
+    A synchronous ``QueryResponse`` returns its rows inline but goes on saving
+    the full result in the background, so the reply is not the finish line and
+    Arrow cannot be fetched yet. The run turns ``succeeded`` only once that
+    result is saved and ready, which makes it a sufficient readiness signal on
+    its own.
+
+    The earlier version polled ``GET /results/{id}`` instead, which is the
+    result *data* endpoint: a ready JSON reply carries the whole result, so the
+    check downloaded all of it to read one status field, and the server refuses
+    that outright once the result is large enough.
     """
     calls: list[str] = []
 
@@ -46,16 +63,16 @@ def test_fetch_table_waits_for_ready_before_arrow(monkeypatch: pytest.MonkeyPatc
             calls.append("query")
             return _query_response("rslt1")
 
-    statuses = iter(["processing", "processing", "ready"])
+    statuses = iter(["running", "running", "succeeded"])
 
-    class FakeResultsApi:
+    class FakeQueryRunsApi:
         def __init__(self, api: object) -> None:
             pass
 
-        def get_result(self, result_id: str, **kwargs: Any) -> Any:
+        def get_query_run(self, query_run_id: str, **kwargs: Any) -> Any:
             status = next(statuses)
-            calls.append(f"get_result:{status}")
-            return SimpleNamespace(status=status, result_id=result_id, error_message=None)
+            calls.append(f"get_query_run:{status}")
+            return SimpleNamespace(status=status, result_id="rslt1", error_message=None)
 
     class FakeArrowResultsApi:
         def __init__(self, api: object) -> None:
@@ -66,7 +83,7 @@ def test_fetch_table_waits_for_ready_before_arrow(monkeypatch: pytest.MonkeyPatc
             return pa.table({"id": [1, 2]})
 
     monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
-    monkeypatch.setattr(mc, "ResultsApi", FakeResultsApi)
+    monkeypatch.setattr(mc, "QueryRunsApi", FakeQueryRunsApi)
     monkeypatch.setattr(mc, "ArrowResultsApi", FakeArrowResultsApi)
     monkeypatch.setattr(mc.time, "sleep", lambda _seconds: None)
 
@@ -83,10 +100,23 @@ def test_fetch_table_waits_for_ready_before_arrow(monkeypatch: pytest.MonkeyPatc
 
     assert table is not None
     assert table.num_rows == 2
-    # The result was polled to readiness, and Arrow was fetched only afterwards.
-    assert "get_result:processing" in calls
-    assert "get_result:ready" in calls
-    assert calls.index("arrow") > calls.index("get_result:ready")
+    # The run was polled while still running, and Arrow was fetched only once
+    # it had succeeded.
+    assert "get_query_run:running" in calls
+    assert calls.index("arrow") > calls.index("get_query_run:succeeded")
+
+
+def test_readiness_never_touches_the_json_results_endpoint() -> None:
+    """The generated ``ResultsApi`` -- the JSON result *data* endpoint -- must
+    not be reachable from this module at all.
+
+    Its absence is the fix: readiness comes from the query run, and the only
+    result endpoint this client is allowed to call is the streaming Arrow one,
+    imported under a distinct name. A future edit that reintroduces the plain
+    ``ResultsApi`` here is reintroducing a whole-result download per poll.
+    """
+    assert not hasattr(mc, "ResultsApi")
+    assert hasattr(mc, "ArrowResultsApi")
 
 
 def _fake_runtime() -> SimpleNamespace:
@@ -99,19 +129,18 @@ def _fake_runtime() -> SimpleNamespace:
     )
 
 
-def test_fetch_table_carries_database_scope_on_result_reads(
+def test_fetch_table_carries_database_scope_on_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Results (and runs) of a database-scoped query are database-scoped:
-    the results endpoints 400 with "X-Database-Id header is required" when
-    the scope is missing. ``fetch_table`` must carry the database id on the
-    result poll and the Arrow fetch, not only on the query submit — the
-    hotdata 0.6.0 SDK exposes ``x_database_id`` on all three.
+    """Runs (and results) of a database-scoped query are database-scoped: the
+    endpoints 400 with "X-Database-Id header is required" when the scope is
+    missing. ``fetch_table`` must carry the database id on the run poll and the
+    Arrow fetch, not only on the query submit.
 
     Regression: reruns/append loads against an existing synced table failed
     with an opaque ``400: Bad Request`` because both reads omitted the scope.
     """
-    result_scopes: list[str | None] = []
+    run_scopes: list[str | None] = []
     arrow_scopes: list[str | None] = []
 
     class FakeQueryApi:
@@ -122,26 +151,26 @@ def test_fetch_table_carries_database_scope_on_result_reads(
             assert x_database_id == "db1"
             return _query_response("rslt1")
 
-    class FakeResultsApi:
+    class FakeQueryRunsApi:
         def __init__(self, api: object) -> None:
             pass
 
-        def get_result(self, result_id: str, *, x_database_id: str | None = None) -> Any:
-            result_scopes.append(x_database_id)
-            return SimpleNamespace(status="ready", result_id=result_id, error_message=None)
+        # x_database_id is REQUIRED on this endpoint -- mirroring that here
+        # makes this test fail if a caller ever drops the scope again.
+        def get_query_run(self, query_run_id: str, *, x_database_id: str) -> Any:
+            run_scopes.append(x_database_id)
+            return SimpleNamespace(status="succeeded", result_id="rslt1", error_message=None)
 
     class FakeArrowResultsApi:
         def __init__(self, api: object) -> None:
             pass
 
-        # x_database_id is REQUIRED in the 0.6.0 SDK — mirroring that here
-        # makes this test fail if a caller ever drops the scope again.
         def get_result_arrow(self, result_id: str, *, x_database_id: str) -> pa.Table:
             arrow_scopes.append(x_database_id)
             return pa.table({"id": [1]})
 
     monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
-    monkeypatch.setattr(mc, "ResultsApi", FakeResultsApi)
+    monkeypatch.setattr(mc, "QueryRunsApi", FakeQueryRunsApi)
     monkeypatch.setattr(mc, "ArrowResultsApi", FakeArrowResultsApi)
 
     client = mc.ManagedDatabaseClient(
@@ -156,8 +185,173 @@ def test_fetch_table_carries_database_scope_on_result_reads(
     table = client.fetch_table(database="mydb", schema="public", table="orders")
 
     assert table is not None
-    assert result_scopes == ["db1"]
+    assert run_scopes == ["db1"]
     assert arrow_scopes == ["db1"]
+
+
+def test_interrupted_query_run_is_retried_not_waited_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``interrupted`` is terminal but safe to retry: the server lost the run
+    rather than rejecting the query.
+
+    It has to be raised as transient so the surrounding retry re-runs the
+    query. The earlier poll recognised only ``failed`` and a ``cancelled``
+    status the API never sends, so an interrupted run matched neither -- it
+    spun for the full five-minute timeout and then failed.
+    """
+    calls: list[str] = []
+    statuses = iter(["interrupted", "succeeded"])
+
+    class FakeQueryApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def query(self, request: object, *, x_database_id: str) -> QueryResponse:
+            calls.append("query")
+            return _query_response("rslt1")
+
+    class FakeQueryRunsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_query_run(self, query_run_id: str, **kwargs: Any) -> Any:
+            status = next(statuses)
+            calls.append(f"get_query_run:{status}")
+            return SimpleNamespace(
+                status=status,
+                result_id="rslt1",
+                error_message="instance lost" if status == "interrupted" else None,
+            )
+
+    class FakeArrowResultsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_result_arrow(self, result_id: str, **kwargs: Any) -> pa.Table:
+            calls.append("arrow")
+            return pa.table({"id": [1]})
+
+    monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
+    monkeypatch.setattr(mc, "QueryRunsApi", FakeQueryRunsApi)
+    monkeypatch.setattr(mc, "ArrowResultsApi", FakeArrowResultsApi)
+    monkeypatch.setattr(mc.time, "sleep", lambda _seconds: None)
+
+    client = mc.ManagedDatabaseClient(
+        api_key="k",
+        workspace_id="w",
+        api_base_url="https://example.test",
+        max_retries=2,
+        retry_backoff_seconds=0.0,
+    )
+    client._runtime = _fake_runtime()
+
+    table = client.fetch_table(database="mydb", schema="public", table="orders")
+
+    assert table is not None
+    # The interrupted run re-ran the query rather than being waited out.
+    assert calls.count("query") == 2
+    assert calls == [
+        "query",
+        "get_query_run:interrupted",
+        "query",
+        "get_query_run:succeeded",
+        "arrow",
+    ]
+
+
+def test_failed_query_run_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``failed`` means the query itself failed, so every retry reaches the same
+    answer. It must surface the run's own message rather than being re-run."""
+    calls: list[str] = []
+
+    class FakeQueryApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def query(self, request: object, *, x_database_id: str) -> QueryResponse:
+            calls.append("query")
+            return _query_response("rslt1")
+
+    class FakeQueryRunsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_query_run(self, query_run_id: str, **kwargs: Any) -> Any:
+            return SimpleNamespace(
+                status="failed", result_id=None, error_message="no such column: nope"
+            )
+
+    monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
+    monkeypatch.setattr(mc, "QueryRunsApi", FakeQueryRunsApi)
+    monkeypatch.setattr(mc.time, "sleep", lambda _seconds: None)
+
+    client = mc.ManagedDatabaseClient(
+        api_key="k",
+        workspace_id="w",
+        api_base_url="https://example.test",
+        max_retries=3,
+        retry_backoff_seconds=0.0,
+    )
+    client._runtime = _fake_runtime()
+
+    with pytest.raises(HotdataTerminalError, match="no such column"):
+        client.fetch_table(database="mydb", schema="public", table="orders")
+
+    assert calls.count("query") == 1
+
+
+def test_result_id_is_read_off_the_run_not_the_query_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``succeeded`` run reports ``result_id: null`` when every row came back
+    inline but the result could not be saved for later retrieval.
+
+    The query reply's own ``result_id`` is optimistic -- it names a result that
+    may never resolve -- so the run's is the one to believe. Believing the reply
+    means fetching Arrow against an id the server will 404.
+    """
+    arrow_calls: list[str] = []
+
+    class FakeQueryApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def query(self, request: object, *, x_database_id: str) -> QueryResponse:
+            # The reply hands out an id...
+            return _query_response("rslt1")
+
+    class FakeQueryRunsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_query_run(self, query_run_id: str, **kwargs: Any) -> Any:
+            # ...that the run says was never saved.
+            return SimpleNamespace(status="succeeded", result_id=None, error_message=None)
+
+    class FakeArrowResultsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_result_arrow(self, result_id: str, **kwargs: Any) -> pa.Table:
+            arrow_calls.append(result_id)
+            return pa.table({"id": [1]})
+
+    monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
+    monkeypatch.setattr(mc, "QueryRunsApi", FakeQueryRunsApi)
+    monkeypatch.setattr(mc, "ArrowResultsApi", FakeArrowResultsApi)
+
+    client = mc.ManagedDatabaseClient(
+        api_key="k",
+        workspace_id="w",
+        api_base_url="https://example.test",
+        max_retries=1,
+        retry_backoff_seconds=0.0,
+    )
+    client._runtime = _fake_runtime()
+
+    assert client.fetch_table(database="mydb", schema="public", table="orders") is None
+    assert arrow_calls == []
 
 
 def _load_recording_runtime(calls: list[str], uploads: list[str] | None = None) -> SimpleNamespace:
@@ -415,9 +609,7 @@ def test_load_managed_table_forwards_key(monkeypatch: pytest.MonkeyPatch) -> Non
     ) -> SimpleNamespace:
         captured["mode"] = mode
         captured["key"] = key
-        return SimpleNamespace(
-            connection_id="c", schema_name=schema, table_name=table, row_count=0
-        )
+        return SimpleNamespace(connection_id="c", schema_name=schema, table_name=table, row_count=0)
 
     client = _managed_client(max_retries=1)
     runtime = _fake_runtime()
@@ -428,3 +620,125 @@ def test_load_managed_table_forwards_key(monkeypatch: pytest.MonkeyPatch) -> Non
         "db", "orders", schema="public", upload_id="u1", mode="delete", key=["id"]
     )
     assert captured == {"mode": "delete", "key": ["id"]}
+
+
+def test_query_is_submitted_async_so_no_preview_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``fetch_table`` wants a result id, not rows.
+
+    A synchronous submit always serialises an inline preview of the result into
+    its reply, and there is no request field that suppresses it -- so the only
+    way not to be sent megabytes this path never reads is to ask
+    asynchronously. The async reply carries a run id and nothing else.
+    """
+    requests: list[Any] = []
+
+    class FakeQueryApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def query(self, request: Any, *, x_database_id: str) -> AsyncQueryResponse:
+            requests.append(request)
+            return _async_query_response()
+
+    class FakeQueryRunsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_query_run(self, query_run_id: str, **kwargs: Any) -> Any:
+            return SimpleNamespace(status="succeeded", result_id="rslt1", error_message=None)
+
+    class FakeArrowResultsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_result_arrow(self, result_id: str, **kwargs: Any) -> pa.Table:
+            return pa.table({"id": [1]})
+
+    monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
+    monkeypatch.setattr(mc, "QueryRunsApi", FakeQueryRunsApi)
+    monkeypatch.setattr(mc, "ArrowResultsApi", FakeArrowResultsApi)
+
+    client = mc.ManagedDatabaseClient(
+        api_key="k",
+        workspace_id="w",
+        api_base_url="https://example.test",
+        max_retries=1,
+        retry_backoff_seconds=0.0,
+    )
+    client._runtime = _fake_runtime()
+
+    table = client.fetch_table(database="mydb", schema="public", table="orders")
+
+    assert table is not None
+    assert len(requests) == 1
+    assert requests[0].var_async is True
+
+
+def test_async_reply_is_followed_through_to_arrow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The async reply carries no ``result_id`` at all -- only a run id.
+
+    So the run is not merely the cheapest way to learn the result is ready, it
+    is the only way to learn the result's id in the first place.
+    """
+    calls: list[str] = []
+    statuses = iter(["running", "succeeded"])
+
+    class FakeQueryApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def query(self, request: object, *, x_database_id: str) -> AsyncQueryResponse:
+            calls.append("query")
+            return _async_query_response()
+
+    class FakeQueryRunsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_query_run(self, query_run_id: str, **kwargs: Any) -> Any:
+            assert query_run_id == "qr"
+            status = next(statuses)
+            calls.append(f"get_query_run:{status}")
+            return SimpleNamespace(
+                status=status,
+                result_id="rslt-from-run" if status == "succeeded" else None,
+                error_message=None,
+            )
+
+    class FakeArrowResultsApi:
+        def __init__(self, api: object) -> None:
+            pass
+
+        def get_result_arrow(self, result_id: str, **kwargs: Any) -> pa.Table:
+            calls.append(f"arrow:{result_id}")
+            return pa.table({"id": [1, 2, 3]})
+
+    monkeypatch.setattr(mc, "QueryApi", FakeQueryApi)
+    monkeypatch.setattr(mc, "QueryRunsApi", FakeQueryRunsApi)
+    monkeypatch.setattr(mc, "ArrowResultsApi", FakeArrowResultsApi)
+    monkeypatch.setattr(mc.time, "sleep", lambda _seconds: None)
+
+    client = mc.ManagedDatabaseClient(
+        api_key="k",
+        workspace_id="w",
+        api_base_url="https://example.test",
+        max_retries=1,
+        retry_backoff_seconds=0.0,
+    )
+    client._runtime = _fake_runtime()
+
+    table = client.fetch_table(database="mydb", schema="public", table="orders")
+
+    assert table is not None
+    assert table.num_rows == 3
+    # The id Arrow was fetched with came off the run, not the query reply.
+    assert calls == [
+        "query",
+        "get_query_run:running",
+        "get_query_run:succeeded",
+        "arrow:rslt-from-run",
+    ]
